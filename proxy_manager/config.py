@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from proxy_manager.models import LOCAL_PORT, AppRule, ProxySettings
+from proxy_manager.network import AUTO_INTERFACE
+from proxy_manager.presets import default_apps
+
+CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CONFIG_VERSION = 10
+RECENT_APPS_MAX = 20
+
+
+def _ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _app_to_dict(app: AppRule) -> dict:
+    return {
+        "id": app.id,
+        "name": app.name,
+        "patterns": app.patterns,
+        "use_proxy": app.use_proxy,
+        "enabled": app.enabled,
+        "command": app.command,
+        "category": app.category,
+        "notes": app.notes,
+        "network_interface": app.network_interface,
+    }
+
+
+def _app_from_dict(data: dict) -> AppRule:
+    return AppRule(
+        id=data["id"],
+        name=data["name"],
+        patterns=data.get("patterns", []),
+        use_proxy=data.get("use_proxy", True),
+        enabled=data.get("enabled", True),
+        command=data.get("command", ""),
+        category=data.get("category", "custom"),
+        notes=data.get("notes", ""),
+        network_interface=data.get("network_interface", AUTO_INTERFACE),
+    )
+
+
+class ConfigStore:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or CONFIG_FILE
+        self.proxy = ProxySettings()
+        self.apps: list[AppRule] = []
+        self.recent_app_ids: list[str] = []
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            self.proxy = ProxySettings()
+            self.apps = default_apps()
+            self.save()
+            return
+
+        with open(self.path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        proxy_data = data.get("proxy", {})
+        legacy_host = proxy_data.get("host", "")
+        legacy_port = int(proxy_data.get("port", LOCAL_PORT))
+        upstream_host = proxy_data.get("upstream_host", "")
+        upstream_port = int(proxy_data.get("upstream_port", legacy_port))
+        if not upstream_host and legacy_host not in ("", "127.0.0.1", "localhost", "::1"):
+            upstream_host = legacy_host
+            upstream_port = legacy_port if legacy_port != LOCAL_PORT else 8080
+
+        self.proxy = ProxySettings(
+            enabled=proxy_data.get("enabled", False),
+            source=proxy_data.get("source", "custom"),
+            scheme=proxy_data.get("scheme", "http"),
+            upstream_host=upstream_host,
+            upstream_port=upstream_port,
+            username=proxy_data.get("username", ""),
+            password=proxy_data.get("password", ""),
+            paid_provider=proxy_data.get("paid_provider", "smartproxy"),
+            auto_proxy_mode=proxy_data.get("auto_proxy_mode", "fast"),  # type: ignore[arg-type]
+            target_country=proxy_data.get("target_country", ""),
+            no_proxy=proxy_data.get("no_proxy", "localhost,127.0.0.1,::1"),
+            extra_ca_certs=proxy_data.get("extra_ca_certs", ""),
+            host=legacy_host,
+            port=legacy_port,
+        )
+        self.apps = [_app_from_dict(a) for a in data.get("apps", [])]
+        if not self.apps:
+            self.apps = default_apps()
+        self.recent_app_ids: list[str] = list(data.get("recent_app_ids", []))
+
+        if data.get("config_version", 1) < CONFIG_VERSION:
+            self._migrate(data.get("config_version", 1))
+            self.save()
+
+    def _migrate(self, from_version: int) -> None:
+        if from_version < 2:
+            for app in self.apps:
+                if app.id in ("cursor", "openai"):
+                    app.use_proxy = False
+        if from_version < 3:
+            for app in self.apps:
+                if app.id == "claude":
+                    app.name = "Claude Code"
+                    app.notes = "CLI — use Ligar proxy no app"
+        if from_version < 4:
+            for app in self.apps:
+                app.use_proxy = False
+        if from_version < 5:
+            p = self.proxy
+            if p.upstream_host in ("", "127.0.0.1", "localhost") and p.host not in (
+                "",
+                "127.0.0.1",
+                "localhost",
+            ):
+                p.upstream_host = p.host
+                p.upstream_port = p.port if p.port != LOCAL_PORT else 8080
+        if from_version < 6:
+            if self.proxy.upstream_host and self.proxy.source == "custom":
+                pass  # mantém personalizado
+        if from_version < 7:
+            if not self.proxy.upstream_host.strip() and self.proxy.source == "custom":
+                self.proxy.source = "free"
+        if from_version < 8:
+            pass  # auto_proxy_mode default fast — não altera upstream já configurado
+        if from_version < 9:
+            pass  # target_country default ""
+        if from_version < 10:
+            pass  # recent_app_ids default []
+
+    def touch_recent_app(self, app_id: str) -> None:
+        recent = [aid for aid in self.recent_app_ids if aid != app_id]
+        recent.insert(0, app_id)
+        self.recent_app_ids = recent[:RECENT_APPS_MAX]
+        self.save()
+
+    def save(self) -> None:
+        _ensure_config_dir()
+        payload = {
+            "config_version": CONFIG_VERSION,
+            "proxy": {
+                "enabled": self.proxy.enabled,
+                "source": self.proxy.source,
+                "scheme": self.proxy.scheme,
+                "upstream_host": self.proxy.upstream_host,
+                "upstream_port": self.proxy.upstream_port,
+                "username": self.proxy.username,
+                "password": self.proxy.password,
+                "paid_provider": self.proxy.paid_provider,
+                "auto_proxy_mode": self.proxy.auto_proxy_mode,
+                "target_country": self.proxy.target_country,
+                "no_proxy": self.proxy.no_proxy,
+                "extra_ca_certs": self.proxy.extra_ca_certs,
+            },
+            "apps": [_app_to_dict(a) for a in self.apps],
+            "recent_app_ids": self.recent_app_ids,
+        }
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    def get_app(self, app_id: str) -> AppRule | None:
+        for app in self.apps:
+            if app.id == app_id:
+                return app
+        return None
+
+    def add_app(self, app: AppRule) -> None:
+        self.apps.append(app)
+        self.save()
+
+    def remove_app(self, app_id: str) -> None:
+        self.apps = [a for a in self.apps if a.id != app_id]
+        self.save()
+
+    def update_app(self, app: AppRule) -> None:
+        for i, existing in enumerate(self.apps):
+            if existing.id == app.id:
+                self.apps[i] = app
+                self.save()
+                return
+        self.add_app(app)
+
+    def reset_presets(self) -> None:
+        self.apps = default_apps()
+        self.save()
