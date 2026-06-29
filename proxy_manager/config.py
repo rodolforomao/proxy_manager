@@ -11,7 +11,7 @@ from proxy_manager.profiles import ProxyProfile
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CONFIG_VERSION = 11
+CONFIG_VERSION = 12
 RECENT_APPS_MAX = 20
 
 
@@ -91,6 +91,7 @@ class ConfigStore:
             target_country=proxy_data.get("target_country", ""),
             no_proxy=proxy_data.get("no_proxy", "localhost,127.0.0.1,::1"),
             extra_ca_certs=proxy_data.get("extra_ca_certs", ""),
+            network_interface=proxy_data.get("network_interface", AUTO_INTERFACE),
             host=legacy_host,
             port=legacy_port,
         )
@@ -141,6 +142,8 @@ class ConfigStore:
             pass  # recent_app_ids default []
         if from_version < 11:
             pass  # upstream_proxy default ""
+        if from_version < 12:
+            pass  # network_interface default AUTO_INTERFACE
 
     def touch_recent_app(self, app_id: str) -> None:
         recent = [aid for aid in self.recent_app_ids if aid != app_id]
@@ -165,6 +168,7 @@ class ConfigStore:
                 "target_country": self.proxy.target_country,
                 "no_proxy": self.proxy.no_proxy,
                 "extra_ca_certs": self.proxy.extra_ca_certs,
+                "network_interface": self.proxy.network_interface,
             },
             "apps": [_app_to_dict(a) for a in self.apps],
             "recent_app_ids": self.recent_app_ids,

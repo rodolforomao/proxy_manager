@@ -119,6 +119,16 @@ def resolve_interface_label(name: str) -> str:
     return name
 
 
+def get_interface_ip(name: str) -> str | None:
+    """Retorna o primeiro IPv4 da interface, ou None se não encontrado/inativa."""
+    if not name or name == AUTO_INTERFACE:
+        return None
+    for iface in list_interfaces(include_virtual=True):
+        if iface.name == name:
+            return iface.ipv4 or None
+    return None
+
+
 def ip_to_interface(ip: str) -> str | None:
     if not ip or ip.startswith("127."):
         return None

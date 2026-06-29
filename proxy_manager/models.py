@@ -28,6 +28,8 @@ class ProxySettings:
     target_country: str = ""
     no_proxy: str = "localhost,127.0.0.1,::1"
     extra_ca_certs: str = ""
+    # Interface de rede para saída do proxy (AUTO_INTERFACE = usa rota padrão do OS)
+    network_interface: str = AUTO_INTERFACE
 
     # legado — migrado para upstream_*
     host: str = ""

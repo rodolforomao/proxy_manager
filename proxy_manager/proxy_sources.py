@@ -8,15 +8,31 @@ import subprocess
 import sys
 import time
 import urllib.error
+import os
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from proxy_manager.countries import country_label
+import proxy_manager.service_status as svc
 from proxy_manager.local_proxy import is_port_open
 from proxy_manager.models import LOCAL_PORT, ProxyScheme, ProxySettings
 from proxy_manager.proxy_health import country_code_for, flag_emoji
 from proxy_manager.tor_country import ensure_tor_for_country
+
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+    "NO_PROXY", "no_proxy",
+)
+
+def _clean_env() -> dict[str, str]:
+    """Retorna env sem variáveis de proxy — evita duplo-proxy ao testar proxies externos."""
+    env = dict(os.environ)
+    for k in _PROXY_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
 
 ProxySource = str  # custom | free | paid | tor
 
@@ -138,6 +154,7 @@ def curl_via_proxy(proxy_url: str, *, timeout: float = 8.0) -> str | None:
                 capture_output=True,
                 text=True,
                 timeout=timeout + 2,
+                env=_clean_env(),
             )
             if result.returncode != 0:
                 continue
@@ -349,24 +366,22 @@ def fetch_free_proxies(max_per_source: int = 40) -> tuple[list[ProxyCandidate], 
 
 
 def probe_proxy(candidate: ProxyCandidate, timeout: float = 8.0) -> ProxyCandidate | None:
+    """Testa se o proxy consegue IP externo E alcança api.anthropic.com (HTTPS CONNECT).
+    Roda curl sem variáveis HTTP_PROXY do ambiente para evitar duplo-proxy."""
     start = time.monotonic()
     proxy_url = candidate_proxy_url(candidate)
+    clean = _clean_env()
     ip = None
     for url in ("https://api.ipify.org", "https://icanhazip.com"):
         try:
             result = subprocess.run(
                 [
-                    "curl",
-                    "-fsSL",
-                    "--max-time",
-                    str(max(1, int(timeout))),
-                    "-x",
-                    proxy_url,
-                    url,
+                    "curl", "-fsSL",
+                    "--max-time", str(max(1, int(timeout))),
+                    "-x", proxy_url, url,
                 ],
-                capture_output=True,
-                text=True,
-                timeout=timeout + 2,
+                capture_output=True, text=True, timeout=timeout + 2,
+                env=clean,
             )
             if result.returncode == 0 and _IP4_RE.match(result.stdout.strip()):
                 ip = result.stdout.strip()
@@ -375,6 +390,28 @@ def probe_proxy(candidate: ProxyCandidate, timeout: float = 8.0) -> ProxyCandida
             continue
     if not ip:
         return None
+
+    # Verifica acesso a api.anthropic.com via HTTPS CONNECT
+    try:
+        r = subprocess.run(
+            [
+                "curl", "-s",
+                "--max-time", str(max(1, int(timeout // 2))),
+                "--connect-timeout", "4",
+                "-o", "/dev/null", "-w", "%{http_code}",
+                "-x", proxy_url,
+                "https://api.anthropic.com/",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            env=clean,
+        )
+        code = r.stdout.strip()
+        # Qualquer resposta HTTP (incluindo 401/403/404) significa que CONNECT funcionou
+        if not (code.isdigit() and int(code) > 0):
+            return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
     latency = (time.monotonic() - start) * 1000
     return ProxyCandidate(
         host=candidate.host,
@@ -507,12 +544,33 @@ def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
     return True, f"Tor — socks5://127.0.0.1:{DEFAULT_TOR_PORT}"
 
 
+_ALLOWED_PROXY_PORTS = frozenset({80, 443, 8080, 8443, 3128, 1080, 8888, 8118})
+
+
+def _detect_open_ports(check_ports: frozenset[int] | None = None) -> frozenset[int]:
+    """Detecta quais portas de saída estão abertas testando conexão a 1.1.1.1."""
+    ports = check_ports or _ALLOWED_PROXY_PORTS
+    open_ports: set[int] = set()
+    import socket as _socket
+    for port in ports:
+        try:
+            with _socket.create_connection(("1.1.1.1", port), timeout=2):
+                open_ports.add(port)
+        except OSError:
+            pass
+    return frozenset(open_ports) if open_ports else ports  # fallback: tenta todos
+
+
 def _auto_configure_fast(settings: ProxySettings) -> tuple[bool, str]:
-    """Rápido = proxy público internacional (opcional por país) ou internet direta."""
+    """Rápido = proxy público internacional (opcional por país)."""
     target = getattr(settings, "target_country", "").strip().upper()
-    candidates, _fetch_msg = fetch_free_proxies(max_per_source=15)
+    candidates, _fetch_msg = fetch_free_proxies(max_per_source=20)
     if candidates:
-        working = test_free_proxies(candidates, limit=16, workers=8)
+        # Filtra apenas portas que a rede local permite
+        open_ports = _detect_open_ports()
+        filtered = [c for c in candidates if c.port in open_ports]
+        pool_candidates = filtered if filtered else candidates
+        working = test_free_proxies(pool_candidates, limit=30, workers=12)
 
         def _check_candidate(candidate: ProxyCandidate) -> tuple[ProxyCandidate, str] | None:
             trial = ProxySettings(
@@ -558,12 +616,16 @@ def _auto_configure_fast(settings: ProxySettings) -> tuple[bool, str]:
     if target:
         return (
             False,
-            f"Nenhum proxy encontrado para {country_label(target)}.\n"
-            "Tente outro país ou limpe o filtro de país.",
+            f"Nenhum proxy externo encontrado para {country_label(target)}.\n"
+            "Tente outro país, limpe o filtro de país, ou use Tor (🧅).",
         )
 
-    apply_fast_direct(settings)
-    return True, "Rápido: internet direta (sem Tor)"
+    return (
+        False,
+        "Nenhum proxy externo gratuito funcionando encontrado.\n"
+        "Verifique sua conexão, tente novamente ou use Tor (🧅).\n"
+        "Para internet direta sem proxy, use o botão ⊘.",
+    )
 
 
 def auto_configure_proxy(
@@ -573,18 +635,30 @@ def auto_configure_proxy(
 ) -> tuple[bool, str]:
     """Configura proxy automaticamente conforme preferência (rápido / Tor)."""
     pref = mode or getattr(settings, "auto_proxy_mode", "fast")
+    svc.update(svc.SVC_AUTOCONFIG, "rodando", f"Iniciando modo '{pref}'…")
 
     if pref == "tor":
-        return _auto_configure_tor(settings)
+        svc.update(svc.SVC_TOR, "rodando", "Configurando Tor…")
+        ok, msg = _auto_configure_tor(settings)
+        svc.update(svc.SVC_TOR, "ok" if ok else "erro", msg)
+        svc.update(svc.SVC_AUTOCONFIG, "ok" if ok else "erro", msg)
+        return ok, msg
+
     if pref == "fast":
-        return _auto_configure_fast(settings)
+        ok, msg = _auto_configure_fast(settings)
+        svc.update(svc.SVC_AUTOCONFIG, "ok" if ok else "aviso", msg)
+        return ok, msg
 
     ok, msg = _auto_configure_fast(settings)
     if ok:
+        svc.update(svc.SVC_AUTOCONFIG, "ok", msg)
         return ok, msg
     ok_tor, msg_tor = _auto_configure_tor(settings)
     if ok_tor:
+        svc.update(svc.SVC_AUTOCONFIG, "ok", msg_tor)
         return ok_tor, msg_tor
+    full = f"{msg} | Fallback Tor: {msg_tor}"
+    svc.update(svc.SVC_AUTOCONFIG, "erro", full)
     return False, f"{msg}\n\nFallback Tor: {msg_tor}"
 
 

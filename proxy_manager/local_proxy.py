@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from proxy_manager.models import LOCAL_PORT, ProxySettings
+import proxy_manager.service_status as svc
 
 APP_DIR = Path.home() / ".local/share/proxy-manager"
 BIN_DIR = APP_DIR / "bin"
@@ -108,9 +109,92 @@ def _clear_pid() -> None:
 
 def is_running() -> bool:
     pid = _read_pid()
-    if pid is not None:
+    if pid is not None and Path(f"/proc/{pid}").exists():
         return True
+    if pid is not None:
+        _clear_pid()
     return is_port_open("127.0.0.1", LOCAL_PORT)
+
+
+def _read_process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return " ".join(p.decode(errors="replace") for p in raw.split(b"\0") if p)
+
+
+def running_upstream_label() -> str | None:
+    """Rota upstream do processo na 7890 ('direct', 'socks5://…', etc.) ou None."""
+    pid = _read_pid()
+    if pid is None or not Path(f"/proc/{pid}").exists():
+        for match in _port_listener_pids(LOCAL_PORT):
+            pid = match
+            break
+        else:
+            return None
+    cmd = _read_process_cmdline(pid)
+    if not cmd:
+        return None
+    lowered = cmd.lower()
+    if "pproxy" in lowered:
+        for part in cmd.split():
+            if part.startswith("-r"):
+                return part[2:] or "direct"
+    if "gost" in lowered:
+        for part in cmd.split():
+            if part.startswith("-F="):
+                return part[3:].replace("direct://", "direct")
+    return "desconhecido"
+
+
+def _port_listener_pids(port: int) -> list[int]:
+    import re
+
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [int(m.group(1)) for m in re.finditer(r"pid=(\d+)", result.stdout)]
+
+
+def upstream_matches(proxy: ProxySettings) -> bool:
+    """True se o proxy local escuta com a mesma rota que a configuração pede."""
+    if not is_port_open("127.0.0.1", LOCAL_PORT):
+        return False
+    expected = _upstream_forward_url(proxy)
+    if expected is None:
+        return False
+    actual = running_upstream_label()
+    if actual is None:
+        return True  # porta aberta, cmdline ilegível — não forçar restart
+    if expected == "direct":
+        return actual in ("direct", "direct://", "desconhecido")
+    return actual == expected
+
+
+def get_running_pid() -> int | None:
+    """Retorna o PID do proxy local se estiver rodando, None caso contrário."""
+    return _read_pid()
+
+
+def get_backend_name() -> str:
+    """Retorna o nome do backend ativo ('gost', 'pproxy' ou 'desconhecido')."""
+    if GOST_BIN.exists():
+        return "gost"
+    try:
+        import pproxy  # noqa: F401
+        return "pproxy"
+    except ImportError:
+        return "desconhecido"
 
 
 def install_gost(force: bool = False) -> tuple[bool, str]:
@@ -187,17 +271,40 @@ def _upstream_forward_url(proxy: ProxySettings) -> str | None:
     return f"{scheme}://{auth}{host}:{proxy.upstream_port}"
 
 
-def _pproxy_cmd(forward: str) -> list[str]:
+def _pproxy_cmd(forward: str, proxy: ProxySettings) -> list[str]:
+    from proxy_manager.network import AUTO_INTERFACE, get_interface_ip
+
     listen = f"http://127.0.0.1:{LOCAL_PORT}"
     remote = "direct" if forward == "direct" else forward
+
+    # Para modos não-Tor com interface selecionada: pproxy suporta /@<ip> para bind do IP local.
+    # Tor usa 127.0.0.1:9050 (loopback) — bind de IP externo é inócuo, mas evitamos por clareza.
+    iface = getattr(proxy, "network_interface", AUTO_INTERFACE)
+    if iface != AUTO_INTERFACE and proxy.source != "tor" and remote != "direct":
+        local_ip = get_interface_ip(iface)
+        if local_ip:
+            # Formato pproxy: scheme://host:port/@<bind_ip>
+            remote = f"{remote}/@{local_ip}"
+
     return [sys.executable, "-m", "pproxy", f"-l{listen}", f"-r{remote}"]
 
 
-def _gost_cmd(forward: str) -> list[str]:
+def _gost_cmd(forward: str, proxy: ProxySettings) -> list[str]:
+    from proxy_manager.network import AUTO_INTERFACE
+
     listen = f"http://127.0.0.1:{LOCAL_PORT}"
+    iface = getattr(proxy, "network_interface", AUTO_INTERFACE)
+
+    # Para Tor (127.0.0.1:9050) interface binding é inútil — Tor gerencia sua própria rota.
+    apply_iface = iface != AUTO_INTERFACE and proxy.source != "tor"
+
     if forward == "direct":
+        if apply_iface:
+            return [str(GOST_BIN), f"-L={listen}", f"-F=direct://?interface={iface}"]
         return [str(GOST_BIN), f"-L={listen}"]
-    return [str(GOST_BIN), f"-L={listen}", f"-F={forward}"]
+
+    fwd = f"{forward}?interface={iface}" if apply_iface else forward
+    return [str(GOST_BIN), f"-L={listen}", f"-F={fwd}"]
 
 
 def _launch_backend(cmd: list[str]) -> subprocess.Popen:
@@ -213,38 +320,55 @@ def _launch_backend(cmd: list[str]) -> subprocess.Popen:
 
 def start_local_proxy(proxy: ProxySettings, wait_seconds: float = 5.0) -> tuple[bool, str]:
     if is_port_open("127.0.0.1", LOCAL_PORT):
-        return True, f"Proxy local já ativo em 127.0.0.1:{LOCAL_PORT}"
+        if upstream_matches(proxy):
+            route = running_upstream_label() or "?"
+            msg = f"Proxy local já ativo em 127.0.0.1:{LOCAL_PORT} → {route}"
+            svc.update(svc.SVC_GOST, "ok", msg)
+            return True, msg
+        expected = _upstream_forward_url(proxy) or "?"
+        actual = running_upstream_label() or "?"
+        svc.update(
+            svc.SVC_GOST,
+            "aviso",
+            f"Rota incorreta ({actual} ≠ {expected}) — reiniciando…",
+        )
+        stop_local_proxy()
+        if is_port_open("127.0.0.1", LOCAL_PORT):
+            _kill_listener_on_port(LOCAL_PORT)
+            _clear_pid()
 
     forward = _upstream_forward_url(proxy)
     if not forward:
-        return (
-            False,
-            "Configure o proxy externo em Configurações\n"
-            "(personalizado, gratuito, pago ou Tor).",
-        )
+        msg = "Configure o proxy externo em Configurações (personalizado, gratuito, pago ou Tor)."
+        svc.update(svc.SVC_GOST, "aviso", msg)
+        return False, msg
 
     cmd: list[str] | None = None
     backend = "pproxy"
 
     if GOST_BIN.exists():
-        cmd = _gost_cmd(forward)
+        cmd = _gost_cmd(forward, proxy)
         backend = "gost"
     else:
         try:
             import pproxy  # noqa: F401
         except ImportError:
+            svc.update(svc.SVC_GOST, "rodando", "Baixando gost…")
             ok, msg = install_gost()
             if ok:
-                cmd = _gost_cmd(forward)
+                cmd = _gost_cmd(forward, proxy)
                 backend = "gost"
             else:
+                svc.update(svc.SVC_GOST, "erro", msg)
                 return False, f"{msg}\n\nInstale dependências: pip install pproxy"
         else:
-            cmd = _pproxy_cmd(forward)
+            cmd = _pproxy_cmd(forward, proxy)
 
     if cmd is None:
+        svc.update(svc.SVC_GOST, "erro", "Nenhum backend disponível.")
         return False, "Nenhum backend de proxy local disponível."
 
+    svc.update(svc.SVC_GOST, "rodando", f"Iniciando {backend}…")
     proc = _launch_backend(cmd)
     _write_pid(proc.pid)
 
@@ -255,16 +379,22 @@ def start_local_proxy(proxy: ProxySettings, wait_seconds: float = 5.0) -> tuple[
             tail = ""
             if LOG_FILE.exists():
                 tail = LOG_FILE.read_text(encoding="utf-8")[-400:]
+            msg = f"{backend} encerrou com erro. {tail.strip()}"
+            svc.update(svc.SVC_GOST, "erro", msg)
             return False, f"{backend} encerrou com erro.\n{tail}"
         if is_port_open("127.0.0.1", LOCAL_PORT):
             if proxy.source == "direct":
                 route = "internet direta"
             else:
                 route = f"{proxy.upstream_host}:{proxy.upstream_port}"
+            msg = f"{backend} PID={proc.pid} — :{LOCAL_PORT} → {route}"
+            svc.update(svc.SVC_GOST, "ok", msg)
             return True, f"Proxy local ativo ({backend}): 127.0.0.1:{LOCAL_PORT} → {route}"
         time.sleep(0.15)
 
-    return False, "Timeout aguardando proxy local na porta 7890."
+    msg = "Timeout aguardando proxy local na porta 7890."
+    svc.update(svc.SVC_GOST, "erro", msg)
+    return False, msg
 
 
 def stop_local_proxy() -> tuple[bool, str]:
@@ -284,8 +414,29 @@ def stop_local_proxy() -> tuple[bool, str]:
         time.sleep(0.1)
 
     if is_port_open("127.0.0.1", LOCAL_PORT):
-        return False, "Porta 7890 ainda em uso por outro processo."
+        msg = "Porta 7890 ainda em uso por outro processo."
+        svc.update(svc.SVC_GOST, "aviso", msg)
+        return False, msg
+    svc.update(svc.SVC_GOST, "parado", "Proxy local desligado.")
     return True, "Proxy local desligado."
+
+
+def force_stop_local_proxy() -> tuple[bool, str]:
+    """Encerra o proxy local com várias tentativas — usado no reset de emergência."""
+    stop_watchdog()
+    last_msg = ""
+    for attempt in range(1, 4):
+        ok, last_msg = stop_local_proxy()
+        if ok and not is_port_open("127.0.0.1", LOCAL_PORT):
+            svc.update(svc.SVC_GOST, "parado", "Proxy local encerrado (reset).")
+            return True, "Proxy local encerrado."
+        _kill_listener_on_port(LOCAL_PORT)
+        time.sleep(0.2 * attempt)
+    if is_port_open("127.0.0.1", LOCAL_PORT):
+        msg = f"Porta {LOCAL_PORT} ainda ocupada após reset."
+        svc.update(svc.SVC_GOST, "erro", msg)
+        return False, msg
+    return True, last_msg or "Proxy local encerrado."
 
 
 def ensure_local_proxy(proxy: ProxySettings) -> tuple[bool, str]:
@@ -337,18 +488,39 @@ def stop_watchdog() -> None:
 
 
 def _watchdog_loop() -> None:
+    svc.update(svc.SVC_WATCHDOG, "ok", "Watchdog ativo (intervalo 12s)")
     while not _watchdog_stop.wait(timeout=_WATCHDOG_INTERVAL):
         proxy = _watchdog_proxy
-        if proxy is None:
+        if proxy is None or not proxy.enabled:
             continue
         pid = _read_pid()
         port_open = is_port_open("127.0.0.1", LOCAL_PORT)
         pid_alive = pid is not None and Path(f"/proc/{pid}").exists()
 
-        if port_open and (pid is None or pid_alive):
+        if port_open and (pid is None or pid_alive) and upstream_matches(proxy):
+            pid_str = f"PID={pid}" if pid else "PID=?"
+            route = running_upstream_label() or "?"
+            svc.log_only(svc.SVC_WATCHDOG, f"check OK — {pid_str}, rota {route}")
             continue  # tudo ok
 
+        if port_open and upstream_matches(proxy) is False:
+            svc.update(svc.SVC_WATCHDOG, "aviso", "Rota upstream incorreta — reiniciando…")
+            ok, msg = restart_local_proxy(proxy)
+            if ok:
+                svc.update(svc.SVC_WATCHDOG, "ok", f"Rota corrigida: {msg}")
+            else:
+                svc.update(svc.SVC_WATCHDOG, "erro", f"Falha ao corrigir rota: {msg}")
+            if _watchdog_cb:
+                _watchdog_cb(ok, msg)
+            continue
+
         # Proxy morreu — tentar reiniciar
+        svc.update(svc.SVC_WATCHDOG, "aviso", "Proxy caiu — reiniciando…")
         ok, msg = restart_local_proxy(proxy)
+        if ok:
+            svc.update(svc.SVC_WATCHDOG, "ok", f"Reiniciado: {msg}")
+        else:
+            svc.update(svc.SVC_WATCHDOG, "erro", f"Falha ao reiniciar: {msg}")
         if _watchdog_cb:
             _watchdog_cb(ok, msg)
+    svc.update(svc.SVC_WATCHDOG, "parado", "Watchdog encerrado.")
