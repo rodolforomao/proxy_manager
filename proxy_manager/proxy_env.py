@@ -21,25 +21,27 @@ def build_proxy_env(
     proxy: ProxySettings,
     use_proxy: bool,
     base_env: Mapping[str, str] | None = None,
+    app_upstream: str = "",
 ) -> dict[str, str]:
     env = dict(base_env or os.environ)
     for key in PROXY_KEYS:
         env.pop(key, None)
 
     if use_proxy:
-        url = proxy.url
-        if proxy.scheme == "socks5":
+        # Se app tem upstream próprio, apontar diretamente para ele
+        url = app_upstream.strip() if app_upstream.strip() else proxy.url
+        if proxy.scheme == "socks5" and not app_upstream:
             url = url.replace("socks5://", "socks5h://", 1)
         env["HTTP_PROXY"] = url
         env["HTTPS_PROXY"] = url
         env["http_proxy"] = url
         env["https_proxy"] = url
-        if proxy.scheme.startswith("socks"):
+        if proxy.scheme.startswith("socks") and not app_upstream:
             env["ALL_PROXY"] = url
             env["all_proxy"] = url
         env["NO_PROXY"] = proxy.no_proxy
         env["no_proxy"] = proxy.no_proxy
-        if proxy.extra_ca_certs.strip():
+        if proxy.extra_ca_certs.strip() and not app_upstream:
             ca = proxy.extra_ca_certs.strip()
             env["NODE_EXTRA_CA_CERTS"] = ca
             env["SSL_CERT_FILE"] = ca
@@ -96,4 +98,3 @@ def classify_process_status(
     if active:
         return True, "proxy ativo ✓"
     return False, "sem proxy"
-

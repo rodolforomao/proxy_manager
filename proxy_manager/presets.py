@@ -12,7 +12,7 @@ def default_apps() -> list[AppRule]:
             use_proxy=False,
             category="ai",
             command="claude",
-            notes="CLI — configure proxy externo em Configurações",
+            notes="CLI — proxy via ~/.claude/settings.json (HTTP 127.0.0.1:7890)",
         ),
         AppRule(
             id="cursor",

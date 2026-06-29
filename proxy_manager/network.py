@@ -19,6 +19,12 @@ class NetworkInterface:
 
     @property
     def display(self) -> str:
+        ip = f" {self.ipv4}" if self.ipv4 else ""
+        inactive = " (inativa)" if not self.is_up else ""
+        return f"{self.label}{ip}{inactive}"
+
+    @property
+    def display_full(self) -> str:
         state = "ativa" if self.is_up else "inativa"
         ip = f" ({self.ipv4})" if self.ipv4 else ""
         return f"{self.label} — {self.name}{ip} [{state}]"
@@ -38,7 +44,7 @@ def _guess_kind(name: str) -> str:
 def _kind_label(kind: str) -> str:
     return {
         "wifi": "Wi-Fi",
-        "ethernet": "Ethernet",
+        "ethernet": "Cabo",
         "virtual": "Virtual",
         "other": "Outra",
     }.get(kind, kind.title())
@@ -89,10 +95,19 @@ def list_interfaces(include_virtual: bool = False) -> list[NetworkInterface]:
 
 
 def interface_choices(include_virtual: bool = False) -> list[tuple[str, str]]:
-    choices = [(AUTO_INTERFACE, "Automática (padrão do sistema)")]
+    choices = [(AUTO_INTERFACE, "Automática")]
     for iface in list_interfaces(include_virtual=include_virtual):
         choices.append((iface.name, iface.display))
     return choices
+
+
+def interface_tooltip(name: str) -> str:
+    if name == AUTO_INTERFACE:
+        return "Usa a interface padrão do sistema"
+    for iface in list_interfaces(include_virtual=True):
+        if iface.name == name:
+            return iface.display_full
+    return name
 
 
 def resolve_interface_label(name: str) -> str:

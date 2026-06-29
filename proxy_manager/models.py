@@ -66,6 +66,7 @@ class AppRule:
     category: str = "custom"
     notes: str = ""
     network_interface: str = AUTO_INTERFACE
+    upstream_proxy: str = ""
 
     def matches_process(self, name: str, cmdline: str) -> bool:
         haystack = f"{name} {cmdline}".lower()

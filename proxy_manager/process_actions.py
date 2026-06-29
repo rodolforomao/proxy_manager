@@ -12,6 +12,7 @@ from proxy_manager.browser_proxy import (
     main_browser_command,
     prepare_browser_proxy,
 )
+from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.launcher import launch_command
 from proxy_manager.models import AppRule, ProxySettings
 from proxy_manager.network import AUTO_INTERFACE
@@ -121,7 +122,9 @@ def relaunch_process(
         else:
             raise RuntimeError(f"Processo {pid} não existe e nenhum comando padrão configurado.")
 
-    if app and is_browser_app(app):
+    if app and is_claude_app(app):
+        prepare_claude_proxy(proxy, use_proxy)
+    elif app and is_browser_app(app):
         cmd = main_browser_command(app, cmd)
         prepare_browser_proxy(app, proxy, use_proxy)
 

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from proxy_manager.browser_proxy import is_browser_app, prepare_browser_proxy, wrap_browser_command
+from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.models import AppRule, ProxySettings
 from proxy_manager.network import AUTO_INTERFACE
 from proxy_manager.proxy_env import build_proxy_env
@@ -45,11 +46,14 @@ def launch_command(
     if not cmd:
         raise ValueError("comando vazio")
 
-    if app and is_browser_app(app):
+    if app and is_claude_app(app):
+        prepare_claude_proxy(proxy, use_proxy)
+    elif app and is_browser_app(app):
         prepare_browser_proxy(app, proxy, use_proxy)
         cmd = wrap_browser_command(app, cmd, use_proxy=use_proxy)
 
-    env = build_proxy_env(proxy, use_proxy, base_env)
+    app_upstream = getattr(app, "upstream_proxy", "") if app else ""
+    env = build_proxy_env(proxy, use_proxy, base_env, app_upstream=app_upstream)
 
     if network_interface == AUTO_INTERFACE:
         return subprocess.Popen(

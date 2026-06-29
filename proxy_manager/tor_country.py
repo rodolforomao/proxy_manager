@@ -18,7 +18,7 @@ DEFAULT_SYSTEM_TOR_PORT = 9050
 MANAGED_TOR_PORT = 9051
 
 # Saída Tor por país (ExitNodes) — desligado até testes; usa Tor do sistema :9050.
-TOR_EXIT_COUNTRY_ENABLED = False
+TOR_EXIT_COUNTRY_ENABLED = True
 
 
 def _read_pid() -> int | None:

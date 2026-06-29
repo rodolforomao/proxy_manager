@@ -6,9 +6,11 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 from proxy_manager.models import LOCAL_PORT, ProxySettings
 
@@ -18,12 +20,12 @@ GOST_BIN = BIN_DIR / "gost"
 PID_FILE = Path.home() / ".config/proxy-manager/local-proxy.pid"
 LOG_FILE = Path.home() / ".config/proxy-manager/local-proxy.log"
 
-GOST_VERSION = "2.11.5"
+GOST_VERSION = "3.0.0"
 GOST_URLS = {
-    "x86_64": f"https://github.com/ginuerzh/gost/releases/download/v{GOST_VERSION}/gost-linux-amd64-{GOST_VERSION}.gz",
-    "amd64": f"https://github.com/ginuerzh/gost/releases/download/v{GOST_VERSION}/gost-linux-amd64-{GOST_VERSION}.gz",
-    "aarch64": f"https://github.com/ginuerzh/gost/releases/download/v{GOST_VERSION}/gost-linux-armv8-{GOST_VERSION}.gz",
-    "arm64": f"https://github.com/ginuerzh/gost/releases/download/v{GOST_VERSION}/gost-linux-armv8-{GOST_VERSION}.gz",
+    "x86_64": f"https://github.com/go-gost/gost/releases/download/v{GOST_VERSION}/gost_{GOST_VERSION}_linux_amd64.tar.gz",
+    "amd64": f"https://github.com/go-gost/gost/releases/download/v{GOST_VERSION}/gost_{GOST_VERSION}_linux_amd64.tar.gz",
+    "aarch64": f"https://github.com/go-gost/gost/releases/download/v{GOST_VERSION}/gost_{GOST_VERSION}_linux_arm64.tar.gz",
+    "arm64": f"https://github.com/go-gost/gost/releases/download/v{GOST_VERSION}/gost_{GOST_VERSION}_linux_arm64.tar.gz",
 }
 
 
@@ -53,7 +55,7 @@ def _kill_listener_on_port(port: int, host: str = "127.0.0.1") -> None:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-        time.sleep(0.25)
+        time.sleep(0.1)
         for match in re.finditer(r"pid=(\d+)", result.stdout):
             pid = int(match.group(1))
             if Path(f"/proc/{pid}").exists():
@@ -113,7 +115,18 @@ def is_running() -> bool:
 
 def install_gost(force: bool = False) -> tuple[bool, str]:
     if GOST_BIN.exists() and not force:
-        return True, str(GOST_BIN)
+        # Verificar se é v3 (testa -V)
+        try:
+            result = subprocess.run(
+                [str(GOST_BIN), "-V"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            if GOST_VERSION in result.stdout or GOST_VERSION in result.stderr:
+                return True, str(GOST_BIN)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if not force:
+            return True, str(GOST_BIN)
 
     arch = _machine()
     url = GOST_URLS.get(arch)
@@ -121,20 +134,32 @@ def install_gost(force: bool = False) -> tuple[bool, str]:
         return False, f"Arquitetura não suportada: {arch}"
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    gz_path = APP_DIR / "gost-download.gz"
+    archive_path = APP_DIR / "gost-download.tar.gz"
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        urllib.request.urlretrieve(url, gz_path)
-        import gzip
+        urllib.request.urlretrieve(url, archive_path)
+        import tarfile
 
-        with gzip.open(gz_path, "rb") as src, open(GOST_BIN, "wb") as dst:
-            dst.write(src.read())
+        with tarfile.open(archive_path, "r:gz") as tar:
+            member = next(
+                (m for m in tar.getmembers() if m.name == "gost" or m.name.endswith("/gost")),
+                None,
+            )
+            if member is None:
+                return False, "Binário 'gost' não encontrado no arquivo tar."
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                return False, "Não foi possível extrair o binário 'gost'."
+            with extracted as src, open(GOST_BIN, "wb") as dst:
+                dst.write(src.read())
+
         GOST_BIN.chmod(GOST_BIN.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        gz_path.unlink(missing_ok=True)
+        archive_path.unlink(missing_ok=True)
         return True, str(GOST_BIN)
     except Exception as exc:
-        return False, f"Falha ao baixar gost: {exc}"
+        archive_path.unlink(missing_ok=True)
+        return False, f"Falha ao baixar gost v3: {exc}"
 
 
 def _upstream_forward_url(proxy: ProxySettings) -> str | None:
@@ -170,8 +195,9 @@ def _pproxy_cmd(forward: str) -> list[str]:
 
 def _gost_cmd(forward: str) -> list[str]:
     listen = f"http://127.0.0.1:{LOCAL_PORT}"
-    upstream = "direct://" if forward == "direct" else forward
-    return [str(GOST_BIN), f"-L={listen}", f"-F={upstream}"]
+    if forward == "direct":
+        return [str(GOST_BIN), f"-L={listen}"]
+    return [str(GOST_BIN), f"-L={listen}", f"-F={forward}"]
 
 
 def _launch_backend(cmd: list[str]) -> subprocess.Popen:
@@ -246,7 +272,7 @@ def stop_local_proxy() -> tuple[bool, str]:
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
-            time.sleep(0.3)
+            time.sleep(0.1)
             if Path(f"/proc/{pid}").exists():
                 os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -255,7 +281,7 @@ def stop_local_proxy() -> tuple[bool, str]:
 
     if is_port_open("127.0.0.1", LOCAL_PORT):
         _kill_listener_on_port(LOCAL_PORT)
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     if is_port_open("127.0.0.1", LOCAL_PORT):
         return False, "Porta 7890 ainda em uso por outro processo."
@@ -270,9 +296,59 @@ def ensure_local_proxy(proxy: ProxySettings) -> tuple[bool, str]:
 
 def restart_local_proxy(proxy: ProxySettings) -> tuple[bool, str]:
     stop_local_proxy()
-    time.sleep(0.25)
     if is_port_open("127.0.0.1", LOCAL_PORT):
         _kill_listener_on_port(LOCAL_PORT)
         _clear_pid()
-        time.sleep(0.25)
     return start_local_proxy(proxy, wait_seconds=8.0)
+
+
+# ── Watchdog ────────────────────────────────────────────────────────────────
+
+_WATCHDOG_INTERVAL = 12.0
+_watchdog_stop = threading.Event()
+_watchdog_thread: threading.Thread | None = None
+_watchdog_proxy: ProxySettings | None = None
+_watchdog_cb: Callable[[bool, str], None] | None = None
+
+
+def start_watchdog(
+    proxy: ProxySettings,
+    on_event: Callable[[bool, str], None],
+) -> None:
+    """Inicia thread que monitora o proxy local e reinicia se morrer."""
+    global _watchdog_thread, _watchdog_stop, _watchdog_proxy, _watchdog_cb
+    stop_watchdog()
+    _watchdog_proxy = proxy
+    _watchdog_cb = on_event
+    _watchdog_stop = threading.Event()
+    _watchdog_thread = threading.Thread(
+        target=_watchdog_loop, daemon=True, name="proxy-watchdog"
+    )
+    _watchdog_thread.start()
+
+
+def stop_watchdog() -> None:
+    global _watchdog_thread
+    _watchdog_stop.set()
+    if _watchdog_thread and _watchdog_thread.is_alive():
+        _watchdog_thread.join(timeout=2.0)
+    _watchdog_thread = None
+    _watchdog_stop.clear()
+
+
+def _watchdog_loop() -> None:
+    while not _watchdog_stop.wait(timeout=_WATCHDOG_INTERVAL):
+        proxy = _watchdog_proxy
+        if proxy is None:
+            continue
+        pid = _read_pid()
+        port_open = is_port_open("127.0.0.1", LOCAL_PORT)
+        pid_alive = pid is not None and Path(f"/proc/{pid}").exists()
+
+        if port_open and (pid is None or pid_alive):
+            continue  # tudo ok
+
+        # Proxy morreu — tentar reiniciar
+        ok, msg = restart_local_proxy(proxy)
+        if _watchdog_cb:
+            _watchdog_cb(ok, msg)

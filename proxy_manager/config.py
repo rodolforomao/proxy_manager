@@ -7,10 +7,11 @@ from pathlib import Path
 from proxy_manager.models import LOCAL_PORT, AppRule, ProxySettings
 from proxy_manager.network import AUTO_INTERFACE
 from proxy_manager.presets import default_apps
+from proxy_manager.profiles import ProxyProfile
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CONFIG_VERSION = 10
+CONFIG_VERSION = 11
 RECENT_APPS_MAX = 20
 
 
@@ -29,6 +30,7 @@ def _app_to_dict(app: AppRule) -> dict:
         "category": app.category,
         "notes": app.notes,
         "network_interface": app.network_interface,
+        "upstream_proxy": app.upstream_proxy,
     }
 
 
@@ -43,6 +45,7 @@ def _app_from_dict(data: dict) -> AppRule:
         category=data.get("category", "custom"),
         notes=data.get("notes", ""),
         network_interface=data.get("network_interface", AUTO_INTERFACE),
+        upstream_proxy=data.get("upstream_proxy", ""),
     )
 
 
@@ -52,6 +55,8 @@ class ConfigStore:
         self.proxy = ProxySettings()
         self.apps: list[AppRule] = []
         self.recent_app_ids: list[str] = []
+        self.profiles: list[ProxyProfile] = []
+        self.active_profile: str = ""
         self.load()
 
     def load(self) -> None:
@@ -93,6 +98,8 @@ class ConfigStore:
         if not self.apps:
             self.apps = default_apps()
         self.recent_app_ids: list[str] = list(data.get("recent_app_ids", []))
+        self.profiles = [ProxyProfile.from_dict(p) for p in data.get("profiles", [])]
+        self.active_profile = data.get("active_profile", "")
 
         if data.get("config_version", 1) < CONFIG_VERSION:
             self._migrate(data.get("config_version", 1))
@@ -132,6 +139,8 @@ class ConfigStore:
             pass  # target_country default ""
         if from_version < 10:
             pass  # recent_app_ids default []
+        if from_version < 11:
+            pass  # upstream_proxy default ""
 
     def touch_recent_app(self, app_id: str) -> None:
         recent = [aid for aid in self.recent_app_ids if aid != app_id]
@@ -159,6 +168,8 @@ class ConfigStore:
             },
             "apps": [_app_to_dict(a) for a in self.apps],
             "recent_app_ids": self.recent_app_ids,
+            "profiles": [p.to_dict() for p in self.profiles],
+            "active_profile": self.active_profile,
         }
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -187,4 +198,34 @@ class ConfigStore:
 
     def reset_presets(self) -> None:
         self.apps = default_apps()
+        self.save()
+
+    def save_profile(self, name: str) -> ProxyProfile:
+        """Salva configuração atual como perfil nomeado."""
+        import copy
+        profile = ProxyProfile.from_settings(name, copy.deepcopy(self.proxy))
+        existing = next((i for i, p in enumerate(self.profiles) if p.name == name), None)
+        if existing is not None:
+            self.profiles[existing] = profile
+        else:
+            self.profiles.append(profile)
+        self.active_profile = name
+        self.save()
+        return profile
+
+    def load_profile(self, name: str) -> bool:
+        """Carrega um perfil nomeado para a configuração ativa."""
+        import copy
+        profile = next((p for p in self.profiles if p.name == name), None)
+        if profile is None:
+            return False
+        self.proxy = copy.deepcopy(profile.proxy)
+        self.active_profile = name
+        self.save()
+        return True
+
+    def delete_profile(self, name: str) -> None:
+        self.profiles = [p for p in self.profiles if p.name != name]
+        if self.active_profile == name:
+            self.active_profile = ""
         self.save()

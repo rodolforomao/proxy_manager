@@ -11,6 +11,13 @@ from tkinter import messagebox, ttk
 
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
 from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, prepare_browser_proxy
+from proxy_manager.claude_proxy import (
+    ANTHROPIC_API_HOST,
+    claude_proxy_active,
+    claude_proxy_reachable,
+    is_claude_app,
+    prepare_claude_proxy,
+)
 from proxy_manager.config import ConfigStore
 from proxy_manager.countries import country_code_from_label, country_label, country_option_labels
 from proxy_manager.local_proxy import (
@@ -19,9 +26,38 @@ from proxy_manager.local_proxy import (
     restart_local_proxy,
     start_local_proxy,
     stop_local_proxy,
+    start_watchdog,
+    stop_watchdog,
 )
+
+try:
+    from proxy_manager.notifications import (
+        notify_proxy_up,
+        notify_proxy_down,
+        notify_proxy_error,
+        notify_proxy_recovered,
+    )
+    _NOTIFY_AVAILABLE = True
+except ImportError:
+    _NOTIFY_AVAILABLE = False
+    def notify_proxy_up(route: str) -> None: pass  # noqa: E704
+    def notify_proxy_down(reason: str = "") -> None: pass  # noqa: E704
+    def notify_proxy_error(reason: str) -> None: pass  # noqa: E704
+    def notify_proxy_recovered(route: str) -> None: pass  # noqa: E704
+
+try:
+    from proxy_manager.tray import ProxyTray, is_available as tray_available
+    _TRAY_AVAILABLE = True
+except ImportError:
+    _TRAY_AVAILABLE = False
+    def tray_available() -> bool: return False  # noqa: E704
+    class ProxyTray:  # type: ignore[no-redef]
+        def __init__(self, *a, **kw): pass
+        def start(self, **kw): pass
+        def update(self, **kw): pass
+        def stop(self): pass
 from proxy_manager.models import LOCAL_PORT, AppRule, ProcessInfo
-from proxy_manager.network import AUTO_INTERFACE, interface_choices, resolve_interface_label
+from proxy_manager.network import AUTO_INTERFACE, interface_choices, interface_tooltip, list_interfaces, resolve_interface_label
 from proxy_manager.process_actions import read_process_cmdline, relaunch_process
 from proxy_manager.process_cache import ProcessScanner
 from proxy_manager.process_monitor import find_process_for_app, summary_counts
@@ -113,6 +149,11 @@ class ProxyManagerApp(ctk.CTk):
         self._card_status_font = ctk.CTkFont(size=12, weight="bold")
         self._iface_labels = [label for _, label in self._iface_choices]
         self._iface_map = {label: value for value, label in self._iface_choices}
+        self._iface_kinds = {
+            iface.name: iface.kind for iface in list_interfaces(include_virtual=True)
+        }
+        self._tray: ProxyTray | None = None
+        self._iface_refresh_job: str | None = None
         self._apps_render_gen = 0
         self._apps_render_queue: list[tuple[str, object]] = []
         self._apps_render_row = 0
@@ -147,6 +188,11 @@ class ProxyManagerApp(ctk.CTk):
         elif is_running():
             self.after(800, self._verify_running_proxy_on_startup)
 
+        self._start_iface_refresh()
+        self.after(1200, self._start_watchdog)
+        if tray_available():
+            self.after(500, self._start_tray)
+
     def _verify_running_proxy_on_startup(self) -> None:
         if self._auto_config_running or not is_running():
             return
@@ -175,6 +221,68 @@ class ProxyManagerApp(ctk.CTk):
             )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ── Watchdog ────────────────────────────────────────────────────────────
+
+    def _start_watchdog(self) -> None:
+        if not is_running():
+            return
+
+        def on_watchdog_event(ok: bool, msg: str) -> None:
+            if ok:
+                notify_proxy_recovered(msg)
+                self.after(0, lambda m=msg: self.status_label.configure(
+                    text=f"Proxy recuperado: {m[:80]}"
+                ))
+                self.after(0, lambda: self._maybe_fetch_public_ip([], force=True))
+            else:
+                notify_proxy_error(msg)
+                self.after(0, lambda m=msg: self.status_label.configure(
+                    text=f"Proxy caiu: {m[:80]}"
+                ))
+            self.after(0, self._sync_global_switch_label)
+            self.after(0, lambda: self._request_scan(min_interval=2.0))
+
+        start_watchdog(self.store.proxy, on_watchdog_event)
+
+    # ── Tray ────────────────────────────────────────────────────────────────
+
+    def _start_tray(self) -> None:
+        self._tray = ProxyTray(
+            on_show=self._tray_show,
+            on_quit=self._tray_quit,
+            on_toggle_proxy=self._toggle_global_proxy,
+        )
+        self._tray.start(proxy_on=is_running() and self._proxy_verified)
+
+    def _tray_show(self) -> None:
+        self.after(0, lambda: (self.deiconify(), self.lift(), self.focus_force()))
+
+    def _tray_quit(self) -> None:
+        self.after(0, self.on_closing)
+
+    # ── Interface refresh ────────────────────────────────────────────────────
+
+    def _start_iface_refresh(self) -> None:
+        self._schedule_iface_refresh()
+
+    def _schedule_iface_refresh(self) -> None:
+        if self._iface_refresh_job:
+            self.after_cancel(self._iface_refresh_job)
+        self._iface_refresh_job = self.after(30_000, self._refresh_iface_choices)
+
+    def _refresh_iface_choices(self) -> None:
+        new_choices = interface_choices()
+        if new_choices != self._iface_choices:
+            self._iface_choices = new_choices
+            self._iface_labels = [label for _, label in new_choices]
+            self._iface_map = {label: value for value, label in new_choices}
+            self._iface_kinds = {
+                iface.name: iface.kind for iface in list_interfaces(include_virtual=True)
+            }
+            self._apps_list_layout_key = None
+            self._schedule_refresh_apps_list()
+        self._schedule_iface_refresh()
 
     def _reload_proxy_form_from_store(self) -> None:
         if not hasattr(self, "tabview") or self.tabview.get() != "Configurações":
@@ -216,6 +324,14 @@ class ProxyManagerApp(ctk.CTk):
 
     def _clear_browser_proxies_for_apps(self) -> None:
         for app in self.store.apps:
+            if is_claude_app(app):
+                try:
+                    prepare_claude_proxy(self.store.proxy, use_proxy=False)
+                    app.use_proxy = False
+                    self.store.update_app(app)
+                except Exception:
+                    pass
+                continue
             if not is_browser_app(app):
                 continue
             try:
@@ -475,11 +591,11 @@ class ProxyManagerApp(ctk.CTk):
 
     def _active_auto_mode_key(self) -> str:
         p = self.store.proxy
+        if p.source == "tor":
+            return "tor"
         mode = getattr(p, "auto_proxy_mode", "fast")
         if mode in ("fast", "tor"):
             return mode
-        if p.source == "tor":
-            return "tor"
         return "fast"
 
     def _sync_auto_mode_header(self) -> None:
@@ -536,7 +652,8 @@ class ProxyManagerApp(ctk.CTk):
         self.store.save()
         mode = getattr(self.store.proxy, "auto_proxy_mode", "fast")
         # País no Tor fica guardado no config; reaplica só no modo ⚡ por enquanto.
-        if mode == "fast":
+        # Não troca modo se Tor está ativo como source (independente de auto_proxy_mode).
+        if mode == "fast" and self.store.proxy.source != "tor":
             self._select_auto_proxy_mode(mode, force=True)
 
     def _select_auto_proxy_mode(self, mode: str, *, force: bool = False) -> None:
@@ -558,6 +675,7 @@ class ProxyManagerApp(ctk.CTk):
         self._proxy_ip_info = None
         self._proxy_ip_updated_at = 0.0
         self._proxy_ip_fetching = False
+        _prev_verified = self._proxy_verified
         self._proxy_verified = False
         self._pending_reapply_app_ids = [
             proc.matched_app.id
@@ -568,12 +686,18 @@ class ProxyManagerApp(ctk.CTk):
         self._auto_config_running = True
         self._set_swap_status(self._swap_status_for_mode(mode, "start"))
 
+        def _on_configure_fail(prev_v: bool, msg: str) -> None:
+            self._auto_config_running = False
+            self._proxy_verified = prev_v
+            self._sync_auto_mode_header()
+            self._update_header_from_processes(self._scanner.cache)
+            self._sync_global_switch_label()
+            self._request_scan(min_interval=2.0)
+            messagebox.showwarning("Proxy não encontrado", msg)
+
         def worker() -> None:
             try:
-                if is_running():
-                    self.after(0, lambda: self._set_swap_status("Trocando: parando proxy local…"))
-                    stop_local_proxy()
-
+                # Configure first — keep existing proxy alive until we know it works
                 self.after(
                     0,
                     lambda: self._set_swap_status(self._swap_status_for_mode(mode, "configure")),
@@ -581,14 +705,14 @@ class ProxyManagerApp(ctk.CTk):
 
                 ok, config_msg = auto_configure_proxy(self.store.proxy, mode=mode)
                 if not ok:
+                    # Old proxy still running; restore verified state
                     self.after(
                         0,
-                        lambda m=config_msg: self._on_proxy_activation_verified(
-                            False, PublicIpInfo(ip=None), None, m, config_msg
-                        ),
+                        lambda m=config_msg, pv=_prev_verified: _on_configure_fail(pv, m),
                     )
                     return
 
+                # Configure succeeded — now replace the running proxy
                 self.after(
                     0,
                     lambda: self._set_swap_status(self._swap_status_for_mode(mode, "restart")),
@@ -668,6 +792,28 @@ class ProxyManagerApp(ctk.CTk):
         def worker() -> None:
             targets = set(app_ids) if app_ids else None
             for app in self.store.apps:
+                # Claude Code: settings.json é atualizado independente de estar rodando,
+                # pois o Claude lê o arquivo ao iniciar — não precisa estar ativo agora.
+                if is_claude_app(app):
+                    if targets is not None and app.id in targets:
+                        # Estava rodando com proxy antes do switch → força enable
+                        try:
+                            prepare_claude_proxy(self.store.proxy, use_proxy=True)
+                            app.use_proxy = True
+                            app.enabled = True
+                            self.store.update_app(app)
+                        except Exception:
+                            pass
+                    elif app.use_proxy:
+                        # Não rodando mas usuário havia habilitado → mantém settings.json sync
+                        try:
+                            prepare_claude_proxy(self.store.proxy, use_proxy=True)
+                            app.enabled = True
+                            self.store.update_app(app)
+                        except Exception:
+                            pass
+                    continue
+
                 if not app.command.strip():
                     continue
                 if targets is not None and app.id not in targets:
@@ -722,6 +868,9 @@ class ProxyManagerApp(ctk.CTk):
             if config_msg and config_msg not in status:
                 status = f"{verify_msg} — {config_msg}"[:120]
             self._set_swap_status(status)
+            notify_proxy_up(verify_msg[:80])
+            if self._tray:
+                self._tray.update(proxy_on=True)
             self._update_ip_display()
             self._sync_global_switch_label()
             self._reapply_proxy_for_enabled_apps(
@@ -739,6 +888,9 @@ class ProxyManagerApp(ctk.CTk):
             self._update_header_from_processes(self._scanner.cache, preserve_status=True)
             self._sync_global_switch_label()
             self._request_scan(min_interval=2.0)
+            notify_proxy_error(detail[:80])
+            if self._tray:
+                self._tray.update(proxy_on=False)
             messagebox.showwarning("Proxy", detail)
             return
 
@@ -842,7 +994,13 @@ class ProxyManagerApp(ctk.CTk):
             proc = by_app.get(app_id)
             _text, color = self._status_from_proc(proc)
             dot.configure(text_color=color)
-            if proc and proc.proxy_active:
+            truly_proxied = (
+                proc is not None
+                and proc.proxy_active
+                and self._proxy_verified
+                and self.store.proxy.source != "direct"
+            )
+            if truly_proxied:
                 tile.configure(border_color="#4ade80", fg_color="#1e3a2f")
             elif proc:
                 tile.configure(border_color="#fbbf24", fg_color="#334155")
@@ -947,10 +1105,58 @@ class ProxyManagerApp(ctk.CTk):
             hover_color="#334155",
             command=self._reset_presets,
         ).pack(side="left")
+        row += 1
 
+        # ── Perfis ──────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            tab,
+            text="Perfis de proxy",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(16, 4))
+        row += 1
+
+        profile_bar = ctk.CTkFrame(tab, fg_color="transparent")
+        profile_bar.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=4)
+        profile_bar.grid_columnconfigure(0, weight=1)
+
+        self._profile_list_var = ctk.StringVar()
+        self._profile_combo = ctk.CTkComboBox(
+            profile_bar,
+            variable=self._profile_list_var,
+            values=self._get_profile_names(),
+            width=220,
+        )
+        self._profile_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        ctk.CTkButton(
+            profile_bar,
+            text="Carregar",
+            width=80,
+            fg_color="#1d4ed8",
+            hover_color="#2563eb",
+            command=self._load_selected_profile,
+        ).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkButton(
+            profile_bar,
+            text="Salvar como…",
+            width=100,
+            fg_color="#0f766e",
+            hover_color="#0d9488",
+            command=self._save_as_profile,
+        ).grid(row=0, column=2, padx=(0, 4))
+        ctk.CTkButton(
+            profile_bar,
+            text="Excluir",
+            width=70,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            command=self._delete_selected_profile,
+        ).grid(row=0, column=3)
+
+        row += 1
         info = ctk.CTkTextbox(tab, height=140)
-        info.grid(row=row + 1, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
-        tab.grid_rowconfigure(row + 1, weight=1)
+        info.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
+        tab.grid_rowconfigure(row, weight=1)
         info.insert(
             "1.0",
             "Como funciona:\n\n"
@@ -962,6 +1168,63 @@ class ProxyManagerApp(ctk.CTk):
             "• Interruptor PROXY LIGADO no topo; por app use Ligar proxy.\n",
         )
         info.configure(state="disabled")
+
+    # ── Perfis ──────────────────────────────────────────────────────────────
+
+    def _get_profile_names(self) -> list[str]:
+        try:
+            from proxy_manager.profiles import list_profile_names
+            return list_profile_names(self.store)
+        except (ImportError, Exception):
+            return []
+
+    def _refresh_profile_combo(self) -> None:
+        names = self._get_profile_names()
+        self._profile_combo.configure(values=names)
+        if names and not self._profile_list_var.get():
+            self._profile_list_var.set(names[0])
+
+    def _load_selected_profile(self) -> None:
+        name = self._profile_list_var.get().strip()
+        if not name:
+            messagebox.showwarning("Perfis", "Selecione um perfil para carregar.")
+            return
+        try:
+            from proxy_manager.profiles import load_profile
+            load_profile(self.store, name)
+            self.after_idle(self._reload_proxy_form_from_store)
+            self.after_idle(self._sync_global_switch_label)
+        except Exception as exc:
+            messagebox.showerror("Perfis", f"Erro ao carregar perfil:\n{exc}")
+
+    def _save_as_profile(self) -> None:
+        dialog = ctk.CTkInputDialog(text="Nome do perfil:", title="Salvar perfil")
+        name = dialog.get_input()
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        try:
+            self._save_proxy_settings(silent=True)
+            from proxy_manager.profiles import save_profile
+            save_profile(self.store, name)
+            self._refresh_profile_combo()
+            self._profile_list_var.set(name)
+        except Exception as exc:
+            messagebox.showerror("Perfis", f"Erro ao salvar perfil:\n{exc}")
+
+    def _delete_selected_profile(self) -> None:
+        name = self._profile_list_var.get().strip()
+        if not name:
+            messagebox.showwarning("Perfis", "Selecione um perfil para excluir.")
+            return
+        if not messagebox.askyesno("Perfis", f'Excluir o perfil "{name}"?'):
+            return
+        try:
+            from proxy_manager.profiles import delete_profile
+            delete_profile(self.store, name)
+            self._refresh_profile_combo()
+        except Exception as exc:
+            messagebox.showerror("Perfis", f"Erro ao excluir perfil:\n{exc}")
 
     def _auto_mode_key_from_label(self, label: str) -> str:
         for key, text in AUTO_PROXY_MODE_LABELS.items():
@@ -1149,7 +1412,7 @@ class ProxyManagerApp(ctk.CTk):
 
         self.tor_status_label = ctk.CTkLabel(self.tor_panel, text="", anchor="w")
         self.tor_status_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        self._refresh_tor_status()
+        self.after(0, self._refresh_tor_status)
 
         btn_row = ctk.CTkFrame(self.tor_panel, fg_color="transparent")
         btn_row.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
@@ -1196,7 +1459,15 @@ class ProxyManagerApp(ctk.CTk):
         self.tor_status_label.configure(text=msg, text_color=color)
 
     def _start_tor_service(self) -> None:
-        ok, msg = try_start_tor(self._tor_port_value())
+        self.tor_status_label.configure(text="Iniciando Tor…", text_color="#fbbf24")
+
+        def worker() -> None:
+            ok, msg = try_start_tor(self._tor_port_value())
+            self.after(0, lambda o=ok, m=msg: self._on_tor_start_done(o, m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_tor_start_done(self, ok: bool, msg: str) -> None:
         self._refresh_tor_status()
         if ok:
             messagebox.showinfo("Tor", msg)
@@ -1670,6 +1941,8 @@ class ProxyManagerApp(ctk.CTk):
         if proc and proc.proxy_active:
             if self._auto_config_running or not self._proxy_verified:
                 return "◐ Verificando proxy…", "#fbbf24"
+            if self.store.proxy.source == "direct":
+                return "○ Direto (sem proxy externo)", "#94a3b8"
             ip = self._ip_display_for_proxy_active()
             if ip and ip != "—" and ip != "…":
                 return f"● Proxy ativo\nIP web: {ip}", "#4ade80"
@@ -1987,26 +2260,7 @@ class ProxyManagerApp(ctk.CTk):
         status_label.grid(row=0, column=2, rowspan=2, padx=8, pady=12)
         self._app_proxy_status[app.id] = status_label
 
-        iface_values = self._iface_labels
-        iface_map = self._iface_map
-        current_label = next(
-            (label for value, label in self._iface_choices if value == app.network_interface),
-            iface_values[0],
-        )
-        iface_var = ctk.StringVar(value=current_label)
-
-        def on_iface_change(choice: str) -> None:
-            app.network_interface = iface_map.get(choice, AUTO_INTERFACE)
-            self.store.update_app(app)
-
-        net_menu = ctk.CTkOptionMenu(
-            card,
-            values=iface_values,
-            variable=iface_var,
-            command=on_iface_change,
-            width=140,
-        )
-        net_menu.grid(row=0, column=3, rowspan=2, padx=4, pady=12)
+        self._render_iface_selector(card, app, row=0, col=3)
 
         action_values: list[str] = []
         if app.command.strip():
@@ -2032,6 +2286,151 @@ class ProxyManagerApp(ctk.CTk):
             width=110,
         ).grid(row=0, column=4, rowspan=2, sticky="e", padx=(4, 12), pady=12)
 
+    _IFACE_ICONS = {AUTO_INTERFACE: "⚡", "wifi": "📶", "ethernet": "🔌", "other": "◎"}
+
+    def _render_iface_selector(self, parent: ctk.CTkFrame, app: AppRule, *, row: int, col: int) -> None:
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(row=row, column=col, rowspan=2, padx=6, pady=6, sticky="ns")
+
+        tiles: dict[str, ctk.CTkFrame] = {}
+
+        def select(name: str) -> None:
+            app.network_interface = name
+            self.store.update_app(app)
+            for n, t in tiles.items():
+                active = n == app.network_interface
+                t.configure(
+                    border_color="#4ade80" if active else "#475569",
+                    fg_color="#1e3a2f" if active else "#334155",
+                )
+
+        kind_count: dict[str, int] = {}
+        for name, _ in self._iface_choices:
+            if name == AUTO_INTERFACE:
+                continue
+            kind_count[self._iface_kinds.get(name, "other")] = (
+                kind_count.get(self._iface_kinds.get(name, "other"), 0) + 1
+            )
+
+        kind_idx: dict[str, int] = {}
+        for tile_col, (name, _label) in enumerate(self._iface_choices):
+            if name == AUTO_INTERFACE:
+                icon = self._IFACE_ICONS[AUTO_INTERFACE]
+                sub = "Auto"
+                tip = "Usa a interface padrão do sistema"
+            else:
+                kind = self._iface_kinds.get(name, "other")
+                icon = self._IFACE_ICONS.get(kind, "◎")
+                kind_idx[kind] = kind_idx.get(kind, 0) + 1
+                sub = str(kind_idx[kind]) if kind_count.get(kind, 1) > 1 else ""
+                tip = interface_tooltip(name)
+
+            tile = ctk.CTkFrame(
+                frame,
+                width=48,
+                height=52,
+                corner_radius=8,
+                fg_color="#334155",
+                border_width=2,
+                border_color="#475569",
+                cursor="hand2",
+            )
+            tile.grid(row=0, column=tile_col, padx=2)
+            tile.grid_propagate(False)
+
+            icon_lbl = ctk.CTkLabel(tile, text=icon, font=ctk.CTkFont(size=20))
+            icon_lbl.place(relx=0.5, y=4, anchor="n")
+
+            sub_lbl = ctk.CTkLabel(tile, text=sub, font=ctk.CTkFont(size=9), text_color="#94a3b8")
+            sub_lbl.place(relx=0.5, rely=1.0, anchor="s", y=-3)
+
+            Tooltip(tile, tip)
+
+            def _bind(w: object, n: str = name) -> None:
+                w.bind("<Button-1>", lambda _e: select(n))  # type: ignore[union-attr]
+
+            for w in (tile, icon_lbl, sub_lbl):
+                _bind(w)
+
+            tiles[name] = tile
+
+        for n, t in tiles.items():
+            active = n == app.network_interface
+            t.configure(
+                border_color="#4ade80" if active else "#475569",
+                fg_color="#1e3a2f" if active else "#334155",
+            )
+
+    def _build_iface_tiles_widget(
+        self, parent: ctk.CTkBaseClass, default_iface: str
+    ) -> tuple[ctk.CTkFrame, "Callable[[], str]"]:
+        """Build icon-tile network selector for dialogs. Returns (frame, get_selected_fn)."""
+        selected: list[str] = [default_iface]
+        tiles: dict[str, ctk.CTkFrame] = {}
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+        def select(name: str) -> None:
+            selected[0] = name
+            for n, t in tiles.items():
+                active = n == selected[0]
+                t.configure(
+                    border_color="#4ade80" if active else "#475569",
+                    fg_color="#1e3a2f" if active else "#334155",
+                )
+
+        kind_count: dict[str, int] = {}
+        for name, _ in self._iface_choices:
+            if name == AUTO_INTERFACE:
+                continue
+            kind_count[self._iface_kinds.get(name, "other")] = (
+                kind_count.get(self._iface_kinds.get(name, "other"), 0) + 1
+            )
+
+        kind_idx: dict[str, int] = {}
+        for tile_col, (name, _label) in enumerate(self._iface_choices):
+            if name == AUTO_INTERFACE:
+                icon = self._IFACE_ICONS[AUTO_INTERFACE]
+                sub = "Auto"
+                tip = "Usa a interface padrão do sistema"
+            else:
+                kind = self._iface_kinds.get(name, "other")
+                icon = self._IFACE_ICONS.get(kind, "◎")
+                kind_idx[kind] = kind_idx.get(kind, 0) + 1
+                sub = str(kind_idx[kind]) if kind_count.get(kind, 1) > 1 else ""
+                tip = interface_tooltip(name)
+
+            tile = ctk.CTkFrame(
+                frame,
+                width=54,
+                height=58,
+                corner_radius=8,
+                fg_color="#334155",
+                border_width=2,
+                border_color="#475569",
+                cursor="hand2",
+            )
+            tile.grid(row=0, column=tile_col, padx=4)
+            tile.grid_propagate(False)
+
+            icon_lbl = ctk.CTkLabel(tile, text=icon, font=ctk.CTkFont(size=22))
+            icon_lbl.place(relx=0.5, y=5, anchor="n")
+
+            sub_lbl = ctk.CTkLabel(tile, text=sub, font=ctk.CTkFont(size=10), text_color="#94a3b8")
+            sub_lbl.place(relx=0.5, rely=1.0, anchor="s", y=-4)
+
+            Tooltip(tile, tip)
+
+            def _bind(w: object, n: str = name) -> None:
+                w.bind("<Button-1>", lambda _e: select(n))  # type: ignore[union-attr]
+
+            for w in (tile, icon_lbl, sub_lbl):
+                _bind(w)
+
+            tiles[name] = tile
+
+        select(default_iface)
+        return frame, lambda: selected[0]
+
     def _apply_process_tree(self, processes: list[ProcessInfo]) -> None:
         if not hasattr(self, "proc_tree") or not self.proc_tree.winfo_exists():
             return
@@ -2050,13 +2449,15 @@ class ProxyManagerApp(ctk.CTk):
         self._process_cache.clear()
         existing = set(self.proc_tree.get_children())
         new_ids: set[str] = set()
+        iface_lbl = dict(self._iface_choices)
 
         for proc in processes:
             iid = str(proc.pid)
             new_ids.add(iid)
             self._process_cache[proc.pid] = proc
             tag = self._process_tag(proc)
-            net_label = resolve_interface_label(proc.network_interface or "auto")
+            iface_key = proc.network_interface or "auto"
+            net_label = iface_lbl.get(iface_key, iface_key)
             ip_web = self._ip_display_for_proxy_active() if proc.proxy_active else "—"
             values = (
                 proc.matched_app.name if proc.matched_app else "?",
@@ -2103,14 +2504,22 @@ class ProxyManagerApp(ctk.CTk):
 
     def _test_proxy(self) -> None:
         self._save_proxy_settings(silent=True)
-        ok, msg = test_proxy_api(self.store.proxy)
+        self.status_label.configure(text="Testando proxy…")
+        proxy = self.store.proxy
+
+        def worker() -> None:
+            ok, msg = test_proxy_api(proxy)
+            self.after(0, lambda o=ok, m=msg: self._on_test_proxy_done(o, m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_test_proxy_done(self, ok: bool, msg: str) -> None:
+        self._update_header_from_processes(self._scanner.cache)
         if ok:
             messagebox.showinfo("Teste de proxy", msg)
         else:
             ports = detect_listening_proxy_ports()
-            extra = ""
-            if ports:
-                extra = f"\n\nPortas abertas em 127.0.0.1: {ports}"
+            extra = f"\n\nPortas abertas em 127.0.0.1: {ports}" if ports else ""
             messagebox.showerror("Teste de proxy", f"{msg}{extra}")
 
     def _save_proxy_settings(self, silent: bool = False) -> None:
@@ -2223,6 +2632,9 @@ class ProxyManagerApp(ctk.CTk):
         self._apps_list_layout_key = None
         self._schedule_refresh_apps_list()
         self._request_scan(min_interval=2.0)
+        notify_proxy_down()
+        if self._tray:
+            self._tray.update(proxy_on=False)
         if not ok:
             messagebox.showwarning("Proxy", msg)
 
@@ -2327,13 +2739,27 @@ class ProxyManagerApp(ctk.CTk):
                     "Aguarde",
                     "Configuração automática em andamento. Tente novamente em alguns segundos.",
                 )
-                return None
-            ok_auto, msg_auto = auto_configure_proxy(self.store.proxy)
-            if not ok_auto:
-                messagebox.showerror("Proxy externo", msg_auto)
-                return None
-            self.store.save()
-            self._reload_proxy_form_from_store()
+            else:
+                messagebox.showerror("Proxy externo", msg)
+            return None
+
+        if self.store.proxy.source == "direct":
+            messagebox.showwarning(
+                "Sem proxy externo",
+                "O modo atual é Direto — nenhum proxy externo está ativo.\n\n"
+                "Aguarde a busca automática encontrar um proxy ou configure\n"
+                "um proxy externo na aba Configurações.",
+            )
+            return None
+
+        if not self._proxy_verified:
+            messagebox.showwarning(
+                "Proxy não verificado",
+                "O proxy ainda está sendo testado.\n\n"
+                "Aguarde o indicador ficar verde (● PROXY LIGADO) antes\n"
+                "de ligar apps com proxy.",
+            )
+            return None
 
         ok, msg = ensure_local_proxy(self.store.proxy)
         if not ok:
@@ -2348,12 +2774,88 @@ class ProxyManagerApp(ctk.CTk):
         self._sync_global_switch_label()
         return []
 
+    def _apply_claude_proxy(self, app: AppRule, *, use_proxy: bool) -> None:
+        """Configura ~/.claude/settings.json — método oficial para rede bloqueada."""
+        if self._ensure_proxy_for_launch() is None and use_proxy:
+            self._sync_app_toggle(app.id, False, persist=True)
+            return
+
+        try:
+            prepare_claude_proxy(self.store.proxy, use_proxy)
+        except OSError as exc:
+            self._sync_app_toggle(app.id, False, persist=True)
+            messagebox.showerror("Claude Code", f"Não foi possível gravar ~/.claude/settings.json:\n{exc}")
+            return
+
+        app.use_proxy = use_proxy
+        app.enabled = use_proxy
+        self.store.update_app(app)
+        if use_proxy:
+            self._touch_recent_app(app)
+        self._scanner.invalidate()
+        self._request_scan(min_interval=0, debounce_ms=0)
+
+        running = find_process_for_app(
+            app, self.store.apps, self.store.proxy, self._scanner.cache
+        )
+        proxy_url = self.store.proxy.local_url
+
+        if use_proxy:
+            restart_hint = (
+                "Feche a sessão atual (Ctrl+D ou /exit) e abra de novo no terminal:\n  claude"
+                if running
+                else "Abra um terminal e execute:\n  claude"
+            )
+            self._set_swap_status(f"Testando {ANTHROPIC_API_HOST}…")
+
+            def _test_and_show(hint: str = restart_hint, url: str = proxy_url) -> None:
+                ok, reach_msg = claude_proxy_reachable(timeout=8.0)
+
+                def _show() -> None:
+                    if ok:
+                        messagebox.showinfo(
+                            "Claude Code — pronto",
+                            f"Proxy gravado em ~/.claude/settings.json.\n\n"
+                            f"Proxy local: {url}\n"
+                            f"Teste: ✓ {reach_msg}\n\n"
+                            f"{hint}",
+                        )
+                    else:
+                        messagebox.showwarning(
+                            "Claude Code — verificar",
+                            f"Proxy gravado em ~/.claude/settings.json.\n\n"
+                            f"Proxy local: {url}\n"
+                            f"Teste: ✗ {reach_msg}\n\n"
+                            "Verifique se o proxy externo está funcionando e tente novamente.\n\n"
+                            f"{hint}",
+                        )
+                    self._sync_global_switch_label()
+
+                self.after(0, _show)
+
+            threading.Thread(target=_test_and_show, daemon=True).start()
+        else:
+            messagebox.showinfo(
+                "Claude Code",
+                "Proxy removido de ~/.claude/settings.json.\n\n"
+                + (
+                    "Reinicie o Claude Code no terminal para aplicar."
+                    if running
+                    else "Inicie o Claude Code normalmente quando quiser."
+                ),
+            )
+
     def _start_with_proxy(self, app: AppRule) -> None:
         if not app.command.strip():
             messagebox.showwarning("Aviso", "Nenhum comando configurado para este app.")
             return
 
         self._touch_recent_app(app)
+
+        if is_claude_app(app):
+            self._apply_claude_proxy(app, use_proxy=True)
+            return
+
         running = find_process_for_app(
             app, self.store.apps, self.store.proxy, self._scanner.cache
         )
@@ -2395,6 +2897,21 @@ class ProxyManagerApp(ctk.CTk):
         self._launch_app(app, use_proxy=True)
 
     def _stop_proxy(self, app: AppRule, *, revert_toggle: ctk.BooleanVar | None = None) -> None:
+        if is_claude_app(app):
+            if revert_toggle is not None:
+                if not messagebox.askyesno(
+                    "Parar proxy",
+                    "Remover proxy do Claude Code (~/.claude/settings.json)?",
+                ):
+                    self._toggle_syncing.add(app.id)
+                    revert_toggle.set(True)
+                    self._toggle_syncing.discard(app.id)
+                    app.enabled = True
+                    self.store.update_app(app)
+                    return
+            self._apply_claude_proxy(app, use_proxy=False)
+            return
+
         running = find_process_for_app(
             app, self.store.apps, self.store.proxy, self._scanner.cache
         )
@@ -2475,40 +2992,34 @@ class ProxyManagerApp(ctk.CTk):
             if use_proxy:
                 self._touch_recent_app(app)
 
-            time.sleep(0.25)
-            cmdline = " ".join(read_process_cmdline(proc.pid))
-            browser_active = browser_proxy_active(app, cmdline) if is_browser_app(app) else None
-            proxy_active = (
-                browser_active
-                if browser_active is not None
-                else has_active_proxy(read_process_proxy_env(proc.pid))
-            )
-            if use_proxy:
-                app.enabled = proxy_active
-                self.store.update_app(app)
-                self._sync_app_toggle(app.id, proxy_active)
             net = resolve_interface_label(app.network_interface)
+            saved_warnings = list(warnings)
 
-            if use_proxy:
-                if proxy_active:
-                    title = "Proxy aplicado"
-                    body = (
-                        f"{app.name} iniciado (PID {proc.pid}).\n"
-                        f"Proxy: {self.store.proxy.display_url}\n"
-                        f"Rede: {net}"
+            def post_launch() -> None:
+                time.sleep(0.25)
+                try:
+                    cmdline = " ".join(read_process_cmdline(proc.pid))
+                    special = claude_proxy_active(app, cmdline)
+                    if special is None and is_browser_app(app):
+                        special = browser_proxy_active(app, cmdline)
+                    proxy_active = (
+                        special
+                        if special is not None
+                        else has_active_proxy(read_process_proxy_env(proc.pid))
                     )
-                else:
-                    title = "Aviso"
-                    body = (
-                        f"{app.name} iniciado (PID {proc.pid}), mas proxy NÃO detectado no processo.\n"
-                        f"Esperado: {self.store.proxy.display_url}"
-                    )
-                if warnings:
-                    body += "\n\n" + "\n".join(warnings)
-                (messagebox.showwarning if not proxy_active else messagebox.showinfo)(title, body)
-            else:
-                messagebox.showinfo("Iniciado", f"{app.name} iniciado (PID {proc.pid}).\nSem proxy | Rede: {net}")
+                except Exception:
+                    proxy_active = use_proxy
+                if use_proxy:
+                    app.enabled = proxy_active
+                    self.store.update_app(app)
+                self.after(
+                    0,
+                    lambda: self._on_launch_done(
+                        app, proc.pid, use_proxy, proxy_active, saved_warnings, net
+                    ),
+                )
 
+            threading.Thread(target=post_launch, daemon=True).start()
             self._scanner.invalidate()
             self.after(400, lambda: self._request_scan(min_interval=1.0))
         except FileNotFoundError:
@@ -2523,6 +3034,40 @@ class ProxyManagerApp(ctk.CTk):
             if use_proxy:
                 self._sync_app_toggle(app.id, False, persist=True)
             messagebox.showerror("Erro", str(exc))
+
+    def _on_launch_done(
+        self,
+        app: AppRule,
+        pid: int,
+        use_proxy: bool,
+        proxy_active: bool,
+        warnings: list[str],
+        net: str,
+    ) -> None:
+        if not self.winfo_exists():
+            return
+        if use_proxy:
+            self._sync_app_toggle(app.id, proxy_active)
+            if proxy_active:
+                title = "Proxy aplicado"
+                body = (
+                    f"{app.name} iniciado (PID {pid}).\n"
+                    f"Proxy: {self.store.proxy.display_url}\n"
+                    f"Rede: {net}"
+                )
+            else:
+                title = "Aviso"
+                body = (
+                    f"{app.name} iniciado (PID {pid}), mas proxy NÃO detectado no processo.\n"
+                    f"Esperado: {self.store.proxy.display_url}"
+                )
+            if warnings:
+                body += "\n\n" + "\n".join(warnings)
+            (messagebox.showwarning if not proxy_active else messagebox.showinfo)(title, body)
+        else:
+            messagebox.showinfo(
+                "Iniciado", f"{app.name} iniciado (PID {pid}).\nSem proxy | Rede: {net}"
+            )
 
     def _get_selected_process(self) -> ProcessInfo | None:
         selection = self.proc_tree.selection()
@@ -2701,20 +3246,23 @@ class ProxyManagerApp(ctk.CTk):
             justify="left",
         ).grid(row=4, column=1, sticky="w", padx=16, pady=8)
 
-        ctk.CTkLabel(dialog, text="Rede:").grid(row=5, column=0, sticky="w", padx=16, pady=8)
-        iface_values = [label for _, label in self._iface_choices]
-        iface_map = {label: value for value, label in self._iface_choices}
+        ctk.CTkLabel(dialog, text="Rede:").grid(row=5, column=0, sticky="nw", padx=16, pady=(12, 8))
         default_iface = app.network_interface if app else AUTO_INTERFACE
-        current_label = next(
-            (label for value, label in self._iface_choices if value == default_iface),
-            iface_values[0],
+        iface_tiles_frame, get_iface = self._build_iface_tiles_widget(dialog, default_iface)
+        iface_tiles_frame.grid(row=5, column=1, sticky="w", padx=16, pady=8)
+
+        ctk.CTkLabel(
+            dialog,
+            text="Proxy específico\n(opcional):",
+            justify="left",
+        ).grid(row=6, column=0, sticky="nw", padx=16, pady=8)
+        upstream_e = ctk.CTkEntry(
+            dialog,
+            width=300,
+            placeholder_text="http://user:pass@host:port (vazio = usar global)",
         )
-        if current_label not in iface_values:
-            current_label = iface_values[0]
-        iface_var = ctk.StringVar(value=current_label)
-        ctk.CTkOptionMenu(dialog, values=iface_values, variable=iface_var, width=300).grid(
-            row=5, column=1, sticky="ew", padx=16, pady=8
-        )
+        upstream_e.insert(0, getattr(app, "upstream_proxy", "") if app else "")
+        upstream_e.grid(row=6, column=1, sticky="ew", padx=16, pady=8)
 
         def save() -> None:
             name = name_e.get().strip()
@@ -2734,7 +3282,8 @@ class ProxyManagerApp(ctk.CTk):
                 command=command_e.get().strip(),
                 category=app.category if app else "custom",
                 notes=notes_e.get().strip(),
-                network_interface=iface_map.get(iface_var.get(), AUTO_INTERFACE),
+                network_interface=get_iface(),
+                upstream_proxy=upstream_e.get().strip(),
             )
             on_save(new_app)
             close_dialog()
@@ -2742,7 +3291,7 @@ class ProxyManagerApp(ctk.CTk):
             self._request_scan(min_interval=0, debounce_ms=0)
 
         ctk.CTkButton(dialog, text="Salvar", command=save).grid(
-            row=6, column=0, columnspan=2, pady=24
+            row=7, column=0, columnspan=2, pady=24
         )
 
         def show_modal() -> None:
@@ -2772,6 +3321,11 @@ class ProxyManagerApp(ctk.CTk):
         self._modal_open = False
         if self._refresh_job:
             self.after_cancel(self._refresh_job)
+        if self._iface_refresh_job:
+            self.after_cancel(self._iface_refresh_job)
+        stop_watchdog()
+        if self._tray:
+            self._tray.stop()
         stop_local_proxy()
         self.destroy()
 

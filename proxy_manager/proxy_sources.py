@@ -308,18 +308,30 @@ def _parse_proxy_lines(text: str, scheme: ProxyScheme, source: str) -> list[Prox
     return found
 
 
+def _fetch_one_source(
+    args: tuple[str, str], max_per_source: int
+) -> tuple[list["ProxyCandidate"], str | None]:
+    scheme, url = args
+    try:
+        text = _fetch_text(url)
+        source = url.split("/")[2]
+        return _parse_proxy_lines(text, scheme, source=source)[:max_per_source], None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return [], f"{url}: {exc}"
+
+
 def fetch_free_proxies(max_per_source: int = 40) -> tuple[list[ProxyCandidate], str]:
     all_candidates: list[ProxyCandidate] = []
     errors: list[str] = []
 
-    for scheme, url in FREE_PROXY_URLS:
-        try:
-            text = _fetch_text(url)
-            source = url.split("/")[2]
-            batch = _parse_proxy_lines(text, scheme, source=source)[:max_per_source]
-            all_candidates.extend(batch)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            errors.append(f"{url}: {exc}")
+    with ThreadPoolExecutor(max_workers=len(FREE_PROXY_URLS)) as pool:
+        futures = [pool.submit(_fetch_one_source, su, max_per_source) for su in FREE_PROXY_URLS]
+        for future in as_completed(futures):
+            candidates, error = future.result()
+            if error:
+                errors.append(error)
+            else:
+                all_candidates.extend(candidates)
 
     # dedupe preserving order
     unique: list[ProxyCandidate] = []
@@ -501,7 +513,8 @@ def _auto_configure_fast(settings: ProxySettings) -> tuple[bool, str]:
     candidates, _fetch_msg = fetch_free_proxies(max_per_source=15)
     if candidates:
         working = test_free_proxies(candidates, limit=16, workers=8)
-        for candidate in working[:12]:
+
+        def _check_candidate(candidate: ProxyCandidate) -> tuple[ProxyCandidate, str] | None:
             trial = ProxySettings(
                 source="free",
                 scheme=candidate.scheme,
@@ -509,10 +522,25 @@ def _auto_configure_fast(settings: ProxySettings) -> tuple[bool, str]:
                 upstream_port=candidate.port,
             )
             if not verify_upstream_settings(trial, timeout=8):
-                continue
-            if not _matches_target_country(settings, trial):
-                continue
+                return None
             cc = upstream_exit_country(trial, timeout=6)
+            if target and cc != target:
+                return None
+            return candidate, cc
+
+        winner: tuple[ProxyCandidate, str] | None = None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_check_candidate, c) for c in working[:12]]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    winner = result
+                    for f in futures:
+                        f.cancel()
+                    break
+
+        if winner is not None:
+            candidate, cc = winner
             if cc:
                 candidate = ProxyCandidate(
                     host=candidate.host,
@@ -528,8 +556,11 @@ def _auto_configure_fast(settings: ProxySettings) -> tuple[bool, str]:
             return True, f"Rápido: {candidate.host}:{candidate.port} ({label})"
 
     if target:
-        apply_fast_direct(settings)
-        return True, f"Rápido: nenhum proxy em {country_label(target)} — internet direta"
+        return (
+            False,
+            f"Nenhum proxy encontrado para {country_label(target)}.\n"
+            "Tente outro país ou limpe o filtro de país.",
+        )
 
     apply_fast_direct(settings)
     return True, "Rápido: internet direta (sem Tor)"

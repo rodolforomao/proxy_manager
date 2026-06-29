@@ -238,6 +238,24 @@ def test_stop_kills_stale_port() -> None:
     ok("restart substitui upstream (não fica -rdirect)")
 
 
+def test_claude_proxy_settings() -> None:
+    from proxy_manager.models import ProxySettings
+    from proxy_manager.proxy_health import test_proxy_api
+    from proxy_manager.claude_proxy import (
+        claude_settings_proxy_active,
+        prepare_claude_proxy,
+    )
+
+    p = ProxySettings()
+    prepare_claude_proxy(p, use_proxy=True)
+    assert claude_settings_proxy_active(), "settings.json deve apontar para 127.0.0.1:7890"
+    api_ok, api_msg = test_proxy_api(p, timeout=12.0)
+    assert api_ok, f"api.anthropic.com via proxy: {api_msg}"
+    prepare_claude_proxy(p, use_proxy=False)
+    assert not claude_settings_proxy_active()
+    ok("claude settings.json + api.anthropic.com")
+
+
 def test_countries() -> None:
     from proxy_manager.countries import country_label, country_code_from_label, country_option_labels
 
@@ -257,6 +275,7 @@ def main() -> int:
     run("tor_original", test_tor_original)
     run("fast_direct", test_fast_direct)
     run("proxy_verification_logic", test_proxy_verification_logic)
+    run("claude_proxy", test_claude_proxy_settings)
     run("countries", test_countries)
     run("process_scanner", test_process_scanner)
     run("local_proxy_tor", test_local_proxy_tor_chain)
