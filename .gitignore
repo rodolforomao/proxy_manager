@@ -41,6 +41,9 @@ coverage.xml
 .env.*
 !.env.example
 
+# Claude Code (local session)
+.claude/
+
 # IDE
 .vscode/
 .idea/

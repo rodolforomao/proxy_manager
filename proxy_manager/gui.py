@@ -14,6 +14,7 @@ import customtkinter as ctk
 from tkinter import messagebox, ttk
 
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
+from proxy_manager.brand_icon import apply_window_icon
 from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, prepare_browser_proxy
 from proxy_manager.claude_proxy import (
     ANTHROPIC_API_HOST,
@@ -182,7 +183,7 @@ SECTION_RECENT = "◷ Recentes"
 
 class ProxyManagerApp(ctk.CTk):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(className="proxy-manager")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -236,6 +237,7 @@ class ProxyManagerApp(ctk.CTk):
         self.title("Proxy Manager")
         self.geometry("1100x720")
         self.minsize(900, 600)
+        self._update_brand_icon()
 
         self._restore_banner: ctk.CTkFrame | None = None
 
@@ -422,6 +424,11 @@ class ProxyManagerApp(ctk.CTk):
         start_watchdog(self.store.proxy, on_watchdog_event)
 
     # ── Tray ────────────────────────────────────────────────────────────────
+
+    def _update_brand_icon(self, proxy_on: bool | None = None) -> None:
+        if proxy_on is None:
+            proxy_on = is_running() and self._proxy_verified
+        apply_window_icon(self, proxy_on=proxy_on)
 
     def _start_tray(self) -> None:
         self._tray = ProxyTray(
@@ -1375,6 +1382,7 @@ class ProxyManagerApp(ctk.CTk):
             notify_proxy_up(verify_msg[:80])
             if self._tray:
                 self._tray.update(proxy_on=True)
+            self._update_brand_icon(proxy_on=True)
             self._update_ip_display()
             self._sync_global_switch_label()
             self._update_proxy_info_bar()
@@ -1398,6 +1406,7 @@ class ProxyManagerApp(ctk.CTk):
             notify_proxy_error(detail[:80])
             if self._tray:
                 self._tray.update(proxy_on=False)
+            self._update_brand_icon(proxy_on=False)
             self._toast(detail, "warning")
             return
 
@@ -2469,6 +2478,7 @@ class ProxyManagerApp(ctk.CTk):
             if was_verified != ok:
                 self._apps_list_layout_key = None
                 self._schedule_refresh_apps_list()
+                self._update_brand_icon(proxy_on=ok)
         self._update_ip_display()
         self._sync_auto_mode_header()
         self._update_apps_proxy_status_from(self._scanner.cache)
@@ -3313,6 +3323,7 @@ class ProxyManagerApp(ctk.CTk):
         notify_proxy_down()
         if self._tray:
             self._tray.update(proxy_on=False)
+        self._update_brand_icon(proxy_on=False)
         self._update_proxy_info_bar()
         if not ok:
             self._toast(msg, "warning")
@@ -3977,8 +3988,8 @@ class ProxyManagerApp(ctk.CTk):
         win = ctk.CTkToplevel(parent)
         win.title("Apps instalados")
         win.geometry("520x560")
+        win.minsize(400, 400)
         win.transient(parent)
-        win.grab_set()
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
@@ -3989,23 +4000,39 @@ class ProxyManagerApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(win)
         scroll.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
         scroll.grid_columnconfigure(0, weight=1)
-        self._bind_scroll_on_hover(scroll)
+
+        # Scroll por hover no contexto da janela do picker
+        canvas = scroll._parent_canvas
+        def _on_scroll_picker(event):
+            x, y = win.winfo_pointerxy()
+            widget = win.winfo_containing(x, y)
+            w = widget
+            while w is not None:
+                if w is scroll:
+                    if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+                        canvas.yview_scroll(-1, "units")
+                    elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+                        canvas.yview_scroll(1, "units")
+                    return
+                try:
+                    w = w.master
+                except AttributeError:
+                    break
+        win.bind_all("<Button-4>", _on_scroll_picker, add="+")
+        win.bind_all("<Button-5>", _on_scroll_picker, add="+")
+        win.bind_all("<MouseWheel>", _on_scroll_picker, add="+")
 
         status_lbl = ctk.CTkLabel(win, text="Carregando…", text_color="#94a3b8")
         status_lbl.grid(row=2, column=0, pady=4)
 
         _all_apps: list[InstalledApp] = []
-        _btn_refs: list[ctk.CTkButton] = []
 
         def _fill(apps: list[InstalledApp]) -> None:
             for w in scroll.winfo_children():
                 w.destroy()
-            _btn_refs.clear()
             for a in apps:
-                lbl = f"{a.name}"
-                if a.comment:
-                    lbl += f"  —  {a.comment[:60]}"
-                btn = ctk.CTkButton(
+                lbl = a.name + (f"  —  {a.comment[:60]}" if a.comment else "")
+                ctk.CTkButton(
                     scroll,
                     text=lbl,
                     anchor="w",
@@ -4014,13 +4041,24 @@ class ProxyManagerApp(ctk.CTk):
                     text_color="#e2e8f0",
                     font=ctk.CTkFont(size=12),
                     command=lambda picked=a: _select(picked),
-                )
-                btn.pack(fill="x", padx=4, pady=1)
-                _btn_refs.append(btn)
+                ).pack(fill="x", padx=4, pady=1)
             status_lbl.configure(text=f"{len(apps)} app(s)" if apps else "Nenhum app encontrado")
 
         def _select(a: InstalledApp) -> None:
+            # Libera grab antes de destruir para que o diálogo pai recupere o foco
+            try:
+                win.grab_release()
+            except Exception:
+                pass
             win.destroy()
+            # Restaura grab no diálogo pai
+            try:
+                if parent.winfo_exists():
+                    parent.lift()
+                    parent.focus_force()
+                    parent.grab_set()
+            except Exception:
+                pass
             on_pick(a)
 
         def _filter(*_) -> None:
@@ -4036,7 +4074,20 @@ class ProxyManagerApp(ctk.CTk):
                 win.after(0, lambda: (_all_apps.extend(apps), _fill(apps)))
 
         threading.Thread(target=_load, daemon=True).start()
-        search_e.focus_set()
+
+        def _show_picker() -> None:
+            if not win.winfo_exists():
+                return
+            win.lift()
+            win.focus_force()
+            try:
+                win.wait_visibility()
+                win.grab_set()
+            except Exception:
+                pass
+            search_e.focus_set()
+
+        win.after(20, _show_picker)
 
     def _edit_app_dialog(self, app: AppRule) -> None:
         fresh = self.store.get_app(app.id)
@@ -4225,6 +4276,13 @@ def _slug_id(name: str) -> str:
 
 
 def run() -> None:
+    import signal
+
     app = ProxyManagerApp()
+
+    def _raise_existing_instance(_signum=None, _frame=None) -> None:
+        app.after(0, lambda: (app.deiconify(), app.lift(), app.focus_force()))
+
+    signal.signal(signal.SIGUSR1, _raise_existing_instance)
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()

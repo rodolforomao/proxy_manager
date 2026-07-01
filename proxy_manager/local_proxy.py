@@ -271,6 +271,19 @@ def _upstream_forward_url(proxy: ProxySettings) -> str | None:
     return f"{scheme}://{auth}{host}:{proxy.upstream_port}"
 
 
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _pproxy_argv(listen: str, remote: str) -> list[str]:
+    """Comando para iniciar pproxy — no bundle PyInstaller usa proxy-worker."""
+    if _is_frozen():
+        worker = Path(sys.executable).resolve().parent / "pproxy-worker"
+        if worker.is_file():
+            return [str(worker), f"-l{listen}", f"-r{remote}"]
+    return [sys.executable, "-m", "pproxy", f"-l{listen}", f"-r{remote}"]
+
+
 def _pproxy_cmd(forward: str, proxy: ProxySettings) -> list[str]:
     from proxy_manager.network import AUTO_INTERFACE, get_interface_ip
 
@@ -286,7 +299,7 @@ def _pproxy_cmd(forward: str, proxy: ProxySettings) -> list[str]:
             # Formato pproxy: scheme://host:port/@<bind_ip>
             remote = f"{remote}/@{local_ip}"
 
-    return [sys.executable, "-m", "pproxy", f"-l{listen}", f"-r{remote}"]
+    return _pproxy_argv(listen, remote)
 
 
 def _gost_cmd(forward: str, proxy: ProxySettings) -> list[str]:
@@ -309,7 +322,9 @@ def _gost_cmd(forward: str, proxy: ProxySettings) -> list[str]:
 
 def _launch_backend(cmd: list[str]) -> subprocess.Popen:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = open(LOG_FILE, "a", encoding="utf-8")
+    log_handle = open(LOG_FILE, "w", encoding="utf-8")
+    log_handle.write(f"=== {' '.join(cmd)} ===\n")
+    log_handle.flush()
     return subprocess.Popen(
         cmd,
         stdout=log_handle,

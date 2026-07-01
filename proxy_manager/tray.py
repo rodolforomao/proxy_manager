@@ -3,23 +3,15 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
+from proxy_manager.brand_icon import make_brand_icon
+
 _tray_available = False
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image
     _tray_available = True
 except ImportError:
     pass
-
-
-def _make_icon(color: str = "#4ade80") -> "Image.Image":
-    from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-    draw.ellipse((8, 8, 56, 56), fill=(r, g, b, 255))
-    draw.ellipse((24, 24, 40, 40), fill=(0, 0, 0, 180))
-    return img
 
 
 def is_available() -> bool:
@@ -45,7 +37,7 @@ class ProxyTray:
         self._proxy_on = proxy_on
         self._icon = pystray.Icon(
             "proxy-manager",
-            _make_icon("#4ade80" if proxy_on else "#64748b"),
+            make_brand_icon(64, proxy_on=proxy_on),
             self._title(),
             menu=self._build_menu(),
         )
@@ -55,7 +47,7 @@ class ProxyTray:
         if not self._icon:
             return
         self._proxy_on = proxy_on
-        self._icon.icon = _make_icon("#4ade80" if proxy_on else "#64748b")
+        self._icon.icon = make_brand_icon(64, proxy_on=proxy_on)
         self._icon.title = self._title()
         self._icon.menu = self._build_menu()
 
