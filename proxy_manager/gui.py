@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import configparser
 import os
 import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
+from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, scan_installed_apps
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
 from proxy_manager.brand_icon import apply_window_icon
 from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, prepare_browser_proxy
@@ -110,64 +109,6 @@ from proxy_manager.proxy_sources import (
 )
 
 
-# ── Apps instalados (leitura de .desktop) ────────────────────────────────────
-
-@dataclass
-class InstalledApp:
-    name: str
-    command: str
-    comment: str = ""
-
-
-_EXEC_FIELD_CODES = re.compile(r"%[fFuUdDnNickvm]")
-
-def _strip_exec(exec_str: str) -> str:
-    return _EXEC_FIELD_CODES.sub("", exec_str).strip()
-
-
-def scan_installed_apps() -> list[InstalledApp]:
-    """Lê arquivos .desktop e retorna apps instalados, ordenados por nome."""
-    dirs = [
-        Path("/usr/share/applications"),
-        Path("/usr/local/share/applications"),
-        Path.home() / ".local/share/applications",
-        Path("/var/lib/flatpak/exports/share/applications"),
-        Path.home() / ".local/share/flatpak/exports/share/applications",
-        Path("/snap/bin"),
-    ]
-    seen: dict[str, InstalledApp] = {}
-    cp = configparser.RawConfigParser()
-    for d in dirs:
-        if not d.is_dir():
-            continue
-        for f in d.glob("*.desktop"):
-            try:
-                cp.read(str(f), encoding="utf-8")
-                if not cp.has_section("Desktop Entry"):
-                    continue
-                de = dict(cp["Desktop Entry"])
-                if de.get("nodisplay", "").lower() == "true":
-                    continue
-                if de.get("type", "").lower() != "application":
-                    continue
-                name = de.get("name", "").strip()
-                exec_ = _strip_exec(de.get("exec", "").strip())
-                if not name or not exec_:
-                    continue
-                # Usa nome como chave para deduplicar
-                if name not in seen:
-                    seen[name] = InstalledApp(
-                        name=name,
-                        command=exec_,
-                        comment=de.get("comment", ""),
-                    )
-            except Exception:
-                pass
-            finally:
-                cp.clear()
-    return sorted(seen.values(), key=lambda a: a.name.lower())
-
-
 CATEGORY_LABELS = {
     "ai": "IA / Assistentes",
     "browser": "Navegadores",
@@ -238,6 +179,7 @@ class ProxyManagerApp(ctk.CTk):
         self.geometry("1100x720")
         self.minsize(900, 600)
         self._update_brand_icon()
+        self.bind("<Unmap>", self._on_unmap)
 
         self._restore_banner: ctk.CTkFrame | None = None
 
@@ -425,10 +367,33 @@ class ProxyManagerApp(ctk.CTk):
 
     # ── Tray ────────────────────────────────────────────────────────────────
 
+    def _tray_mode(self) -> str:
+        """Ícone exibido na bandeja: 'tor' (cebola), 'fast' (raio) ou 'local' (gateway) —
+        reflete a rota configurada (source), independente dela estar verificada agora."""
+        p = self.store.proxy
+        if not p.enabled:
+            return "local"
+        if p.source == "tor":
+            return "tor"
+        if p.source == "direct":
+            return "local"
+        return "fast"
+
+    def _tray_status(self) -> str:
+        """Bolinha de status: verde=ok, amarelo=conectando/não verificado,
+        vermelho=deveria estar rodando mas caiu, cinza=desligado."""
+        if not self.store.proxy.enabled:
+            return "grey"
+        if is_running():
+            return "green" if self._proxy_verified else "yellow"
+        return "red"
+
     def _update_brand_icon(self, proxy_on: bool | None = None) -> None:
         if proxy_on is None:
             proxy_on = is_running() and self._proxy_verified
         apply_window_icon(self, proxy_on=proxy_on)
+        if self._tray:
+            self._tray.update(mode=self._tray_mode(), status=self._tray_status())
 
     def _start_tray(self) -> None:
         self._tray = ProxyTray(
@@ -436,7 +401,7 @@ class ProxyManagerApp(ctk.CTk):
             on_quit=self._tray_quit,
             on_toggle_proxy=self._toggle_global_proxy,
         )
-        self._tray.start(proxy_on=is_running() and self._proxy_verified)
+        self._tray.start(mode=self._tray_mode(), status=self._tray_status())
         svc_mod.update(svc_mod.SVC_TRAY, "ok", "Ícone de bandeja ativo")
 
     def _tray_show(self) -> None:
@@ -444,6 +409,14 @@ class ProxyManagerApp(ctk.CTk):
 
     def _tray_quit(self) -> None:
         self.after(0, self.on_closing)
+
+    def _on_unmap(self, event) -> None:
+        """Ao minimizar, esconde da barra de tarefas — some só o ícone na bandeja."""
+        if event.widget is not self or self.state() != "iconic":
+            return
+        if not self._tray or not tray_available():
+            return
+        self.after(0, self.withdraw)
 
     # ── Interface refresh ────────────────────────────────────────────────────
 
@@ -1380,8 +1353,6 @@ class ProxyManagerApp(ctk.CTk):
                 status = f"{verify_msg} — {config_msg}"[:120]
             self._set_swap_status(status)
             notify_proxy_up(verify_msg[:80])
-            if self._tray:
-                self._tray.update(proxy_on=True)
             self._update_brand_icon(proxy_on=True)
             self._update_ip_display()
             self._sync_global_switch_label()
@@ -1404,8 +1375,6 @@ class ProxyManagerApp(ctk.CTk):
             self._sync_global_switch_label()
             self._request_scan(min_interval=2.0)
             notify_proxy_error(detail[:80])
-            if self._tray:
-                self._tray.update(proxy_on=False)
             self._update_brand_icon(proxy_on=False)
             self._toast(detail, "warning")
             return
@@ -3321,8 +3290,6 @@ class ProxyManagerApp(ctk.CTk):
         self._schedule_refresh_apps_list()
         self._request_scan(min_interval=2.0)
         notify_proxy_down()
-        if self._tray:
-            self._tray.update(proxy_on=False)
         self._update_brand_icon(proxy_on=False)
         self._update_proxy_info_bar()
         if not ok:
@@ -3977,33 +3944,75 @@ class ProxyManagerApp(ctk.CTk):
             self._refresh_apps_list()
 
     def _add_app_dialog(self) -> None:
-        self._app_dialog("Novo aplicativo", None, self._create_app, allow_browse=True)
+        def _on_pick(picked: InstalledApp) -> None:
+            self._app_dialog_from_pick(picked)
+
+        self._show_app_picker(
+            title="Adicionar aplicativo",
+            on_pick=_on_pick,
+            show_running=True,
+            manual_entry=lambda: self._app_dialog("Novo aplicativo", None, self._create_app),
+        )
+
+    def _app_dialog_from_pick(self, picked: InstalledApp) -> None:
+        slug = re.sub(r"[^a-z0-9]+", "", picked.name.lower())
+        draft = AppRule(
+            id=_slug_id(picked.name),
+            name=picked.name,
+            patterns=[slug] if slug else [picked.name.lower()],
+            command=picked.command,
+            notes=picked.comment,
+        )
+        self._app_dialog("Novo aplicativo", draft, self._create_app)
 
     def _pick_installed_app(
         self,
         parent,
         on_pick: Callable[[InstalledApp], None],
     ) -> None:
-        """Abre sub-diálogo para buscar apps instalados via .desktop."""
-        win = ctk.CTkToplevel(parent)
-        win.title("Apps instalados")
-        win.geometry("520x560")
-        win.minsize(400, 400)
-        win.transient(parent)
+        self._show_app_picker(
+            title="Apps instalados",
+            on_pick=on_pick,
+            parent=parent,
+            show_running=False,
+        )
+
+    def _show_app_picker(
+        self,
+        *,
+        title: str,
+        on_pick: Callable[[InstalledApp], None],
+        parent=None,
+        show_running: bool = True,
+        manual_entry: Callable[[], None] | None = None,
+    ) -> None:
+        """Lista apps da máquina; em execução não configurados aparecem primeiro."""
+        owner = parent if parent is not None else self
+        win = ctk.CTkToplevel(owner)
+        win.title(title)
+        win.geometry("560x620")
+        win.minsize(420, 440)
+        win.transient(owner)
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(1, weight=1)
 
         search_var = ctk.StringVar()
-        search_e = ctk.CTkEntry(win, textvariable=search_var, placeholder_text="Buscar app…")
+        search_e = ctk.CTkEntry(
+            win,
+            textvariable=search_var,
+            placeholder_text="Buscar app…",
+        )
         search_e.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
 
         scroll = ctk.CTkScrollableFrame(win)
         scroll.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
         scroll.grid_columnconfigure(0, weight=1)
 
-        # Scroll por hover no contexto da janela do picker
         canvas = scroll._parent_canvas
+
         def _on_scroll_picker(event):
+            if not win.winfo_exists():
+                return  # bind_all sobrevive ao fechamento da janela; evita TclError
             x, y = win.winfo_pointerxy()
             widget = win.winfo_containing(x, y)
             w = widget
@@ -4018,60 +4027,136 @@ class ProxyManagerApp(ctk.CTk):
                     w = w.master
                 except AttributeError:
                     break
+
         win.bind_all("<Button-4>", _on_scroll_picker, add="+")
         win.bind_all("<Button-5>", _on_scroll_picker, add="+")
         win.bind_all("<MouseWheel>", _on_scroll_picker, add="+")
 
-        status_lbl = ctk.CTkLabel(win, text="Carregando…", text_color="#94a3b8")
-        status_lbl.grid(row=2, column=0, pady=4)
+        footer = ctk.CTkFrame(win, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        footer.grid_columnconfigure(0, weight=1)
 
-        _all_apps: list[InstalledApp] = []
+        status_lbl = ctk.CTkLabel(footer, text="Carregando…", text_color="#94a3b8", anchor="w")
+        status_lbl.grid(row=0, column=0, sticky="w")
 
-        def _fill(apps: list[InstalledApp]) -> None:
-            for w in scroll.winfo_children():
-                w.destroy()
-            for a in apps:
-                lbl = a.name + (f"  —  {a.comment[:60]}" if a.comment else "")
-                ctk.CTkButton(
-                    scroll,
-                    text=lbl,
-                    anchor="w",
-                    fg_color="transparent",
-                    hover_color="#1e293b",
-                    text_color="#e2e8f0",
-                    font=ctk.CTkFont(size=12),
-                    command=lambda picked=a: _select(picked),
-                ).pack(fill="x", padx=4, pady=1)
-            status_lbl.configure(text=f"{len(apps)} app(s)" if apps else "Nenhum app encontrado")
+        if manual_entry is not None:
+            ctk.CTkButton(
+                footer,
+                text="Adicionar manualmente",
+                width=160,
+                fg_color="#475569",
+                hover_color="#334155",
+                command=lambda: (_close(), manual_entry()),
+            ).grid(row=0, column=1, padx=(8, 0))
 
-        def _select(a: InstalledApp) -> None:
-            # Libera grab antes de destruir para que o diálogo pai recupere o foco
+        _running: list[InstalledApp] = []
+        _installed: list[InstalledApp] = []
+        section_font = ctk.CTkFont(size=13, weight="bold")
+
+        def _close() -> None:
             try:
                 win.grab_release()
             except Exception:
                 pass
-            win.destroy()
-            # Restaura grab no diálogo pai
-            try:
-                if parent.winfo_exists():
-                    parent.lift()
-                    parent.focus_force()
-                    parent.grab_set()
-            except Exception:
-                pass
+            if win.winfo_exists():
+                win.destroy()
+            if parent is not None:
+                try:
+                    if parent.winfo_exists():
+                        parent.lift()
+                        parent.focus_force()
+                        parent.grab_set()
+                except Exception:
+                    pass
+
+        def _select(a: InstalledApp) -> None:
+            _close()
             on_pick(a)
 
+        def _matches(app: InstalledApp, query: str) -> bool:
+            return (
+                query in app.name.lower()
+                or query in app.comment.lower()
+                or query in app.command.lower()
+            )
+
+        def _add_row(app: InstalledApp) -> None:
+            detail = f"  —  {app.comment[:72]}" if app.comment else ""
+            ctk.CTkButton(
+                scroll,
+                text=app.name + detail,
+                anchor="w",
+                fg_color="transparent",
+                hover_color="#1e293b",
+                text_color="#e2e8f0",
+                font=ctk.CTkFont(size=12),
+                command=lambda picked=app: _select(picked),
+            ).pack(fill="x", padx=4, pady=1)
+
+        def _fill() -> None:
+            for w in scroll.winfo_children():
+                w.destroy()
+            query = search_var.get().lower().strip()
+            running = [a for a in _running if not query or _matches(a, query)]
+            installed = [a for a in _installed if not query or _matches(a, query)]
+            total = len(running) + len(installed)
+
+            if show_running and running:
+                ctk.CTkLabel(
+                    scroll,
+                    text="▶ Em execução (não configurados)",
+                    text_color="#38bdf8",
+                    font=section_font,
+                    anchor="w",
+                ).pack(fill="x", padx=4, pady=(8, 4))
+                for app in running:
+                    _add_row(app)
+
+            if installed:
+                header = "Apps instalados" if show_running else "Selecione um app"
+                ctk.CTkLabel(
+                    scroll,
+                    text=header,
+                    text_color="#94a3b8",
+                    font=section_font,
+                    anchor="w",
+                ).pack(fill="x", padx=4, pady=(12 if running else 8, 4))
+                for app in installed:
+                    _add_row(app)
+
+            if total == 0:
+                ctk.CTkLabel(
+                    scroll,
+                    text="Nenhum app encontrado.",
+                    text_color="#64748b",
+                ).pack(pady=16)
+
+            parts: list[str] = []
+            if show_running and running:
+                parts.append(f"{len(running)} em execução")
+            if installed:
+                parts.append(f"{len(installed)} instalados")
+            status_lbl.configure(text=" · ".join(parts) if parts else "Nenhum app disponível")
+
         def _filter(*_) -> None:
-            q = search_var.get().lower()
-            filtered = [a for a in _all_apps if q in a.name.lower() or q in a.comment.lower()] if q else _all_apps
-            _fill(filtered)
+            _fill()
 
         search_var.trace_add("write", _filter)
 
         def _load() -> None:
-            apps = scan_installed_apps()
+            if show_running:
+                running, installed = list_add_app_candidates(self.store.apps)
+            else:
+                running, installed = [], scan_installed_apps()
             if win.winfo_exists():
-                win.after(0, lambda: (_all_apps.extend(apps), _fill(apps)))
+                def _apply() -> None:
+                    _running.clear()
+                    _running.extend(running)
+                    _installed.clear()
+                    _installed.extend(installed)
+                    _fill()
+
+                win.after(0, _apply)
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -4085,7 +4170,12 @@ class ProxyManagerApp(ctk.CTk):
                 win.grab_set()
             except Exception:
                 pass
-            search_e.focus_set()
+            if not win.winfo_exists():
+                return  # pode ter sido fechada durante wait_visibility()/grab_set()
+            try:
+                search_e.focus_set()
+            except Exception:
+                pass
 
         win.after(20, _show_picker)
 

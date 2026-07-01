@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -82,9 +83,15 @@ def _read_lock_pid() -> int | None:
         pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
-    if pid > 0 and Path(f"/proc/{pid}").exists():
-        return pid
-    return None
+    if pid <= 0 or not Path(f"/proc/{pid}").exists():
+        return None
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if b"main.py" not in cmdline:
+        return None  # PID reaproveitado por outro processo
+    return pid
 
 
 def _focus_existing_instance() -> bool:
@@ -99,33 +106,90 @@ def _focus_existing_instance() -> bool:
         return False
 
 
+def _prompt_duplicate_instance(pid: int) -> bool:
+    """Pergunta o que fazer ao detectar outra instância rodando (PID `pid`).
+
+    Retorna True se deve encerrar a existente e abrir uma nova.
+    Padrão (Não / fechar a janela) é NÃO iniciar uma nova instância.
+    """
+    import tkinter as tk
+    from tkinter import messagebox
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        return messagebox.askyesno(
+            "Proxy Manager já está em execução",
+            f"Já existe uma instância em execução (PID {pid}).\n\n"
+            "Encerrar a instância existente e abrir uma nova?\n"
+            "Escolher 'Não' mantém a instância atual e cancela a abertura.",
+            default=messagebox.NO,
+        )
+    finally:
+        root.destroy()
+
+
+def _kill_existing_instance(pid: int, timeout: float = 5.0) -> bool:
+    """Encerra a instância `pid` e aguarda ela liberar o lock/processo."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return True  # já não existe
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            return True
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    time.sleep(0.3)
+    return not Path(f"/proc/{pid}").exists()
+
+
 def _acquire_single_instance() -> bool:
-    """Impede duas GUIs simultâneas (causa travamentos e proxy inconsistente)."""
+    """Impede duas GUIs simultâneas (causa travamentos e proxy inconsistente).
+
+    Abre em "a+" (sem truncar) — abrir em "w" apagaria o PID de quem já
+    detém o lock antes mesmo de sabermos se conseguimos adquiri-lo, o que
+    quebrava a leitura do PID existente (e o foco/kill da instância antiga).
+    """
     global _lock_handle
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(LOCK_FILE, "w", encoding="utf-8")
+    handle = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
         return False
-    handle.write(str(__import__("os").getpid()))
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
     handle.flush()
     _lock_handle = handle
     return True
 
 
 def _release_single_instance() -> None:
+    """Libera o lock. Remove o arquivo ANTES de destravar/fechar: evita a janela
+    onde um processo novo poderia criar um inode diferente e ambos pensarem
+    que são a única instância (causa de instâncias duplicadas)."""
     global _lock_handle
     if _lock_handle is None:
         return
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
     try:
         fcntl.flock(_lock_handle.fileno(), fcntl.LOCK_UN)
         _lock_handle.close()
     except OSError:
         pass
     _lock_handle = None
-    LOCK_FILE.unlink(missing_ok=True)
 
 
 def _shutdown(signum=None, frame=None) -> None:
@@ -141,14 +205,26 @@ def _shutdown(signum=None, frame=None) -> None:
 
 def main() -> None:
     if not _acquire_single_instance():
-        if _focus_existing_instance():
+        existing_pid = _read_lock_pid()
+        if existing_pid is None:
+            print(
+                "Proxy Manager já está em execução (PID não identificado).\n"
+                "Feche a outra instância antes de abrir de novo.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _prompt_duplicate_instance(existing_pid):
+            if not (_kill_existing_instance(existing_pid) and _acquire_single_instance()):
+                print(
+                    "Não foi possível encerrar a instância existente.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # instância antiga encerrada — segue o fluxo normal abaixo
+        else:
+            _focus_existing_instance()
             sys.exit(0)
-        print(
-            "Proxy Manager já está em execução.\n"
-            "Feche a outra janela antes de abrir de novo.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Instala ícone e .desktop na primeira execução (e a cada atualização)
     _install_desktop_integration()
