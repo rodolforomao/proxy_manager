@@ -183,6 +183,17 @@ def test_configstore_delete_profile(tmp_path):
     assert store.active_profile == ""
 
 
+def test_claude_proxy_active_per_session():
+    from proxy_manager.claude_proxy import claude_proxy_active, claude_settings_proxy_active
+    from proxy_manager.models import AppRule
+
+    app = AppRule(id="claude", name="Claude Code", patterns=["claude"], command="claude")
+    # Sem PID: usa settings.json (configurado mas parado)
+    assert claude_proxy_active(app, pid=None) is claude_settings_proxy_active()
+    # Com PID fictício sem conexão: não herda settings de outra sessão
+    assert claude_proxy_active(app, pid=999999999) is False
+
+
 def test_claude_tcp_proxy_detection():
     from proxy_manager.claude_proxy import _local_proxy_tcp_hex
 

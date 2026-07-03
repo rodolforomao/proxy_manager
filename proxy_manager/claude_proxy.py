@@ -59,6 +59,54 @@ def _local_proxy_tcp_hex() -> tuple[str, str]:
     return "0100007F", f"{LOCAL_PORT:04X}"
 
 
+def _is_claude_process(name: str, cmdline: str) -> bool:
+    base = name.lower()
+    if base in ("claude", "claude-code"):
+        return True
+    parts = cmdline.split()
+    if parts:
+        from pathlib import Path
+
+        exe = Path(parts[0]).name.lower()
+        if exe in ("claude", "claude-code"):
+            return True
+    return False
+
+
+def list_claude_pids() -> list[int]:
+    """Todos os processos Claude Code em execução (cada terminal = uma sessão)."""
+    import psutil
+
+    pids: list[int] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            info = proc.info
+            name = info.get("name") or ""
+            cmdline = " ".join(info.get("cmdline") or [])
+            if _is_claude_process(name, cmdline):
+                pids.append(int(info["pid"]))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return sorted(pids)
+
+
+def claude_session_stats() -> tuple[int, int]:
+    """Retorna (sessões com proxy ativo, total de sessões)."""
+    pids = list_claude_pids()
+    if not pids:
+        return 0, 0
+    active = sum(1 for pid in pids if process_uses_local_proxy(pid))
+    return active, len(pids)
+
+
+def ensure_claude_settings(proxy: ProxySettings, use_proxy: bool) -> bool:
+    """Grava settings.json e confirma que a seção env ficou correta."""
+    prepare_claude_proxy(proxy, use_proxy)
+    if use_proxy:
+        return claude_settings_proxy_active()
+    return not claude_settings_proxy_active()
+
+
 def process_uses_local_proxy(pid: int) -> bool:
     """True se o processo tem conexão ESTABLISHED com o proxy local."""
     host_hex, port_hex = _local_proxy_tcp_hex()
@@ -165,19 +213,26 @@ def claude_proxy_active(
     *,
     pid: int | None = None,
 ) -> bool | None:
-    """Detecção de proxy para Claude Code (settings.json, env, conexão TCP)."""
+    """Detecção de proxy por sessão Claude (env, TCP ao :7890 — não global)."""
     del cmdline
     if not is_claude_app(app):
         return None
-    if claude_settings_proxy_active():
-        return True
-    # Fallback: processo iniciado manualmente com vars de ambiente
+
+    needle = _local_proxy_url()
+
     if proxy_env:
-        needle = _local_proxy_url()
         for key in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
             if proxy_env.get(key, "").strip() == needle:
                 return True
-    # Sessão já em uso: Claude lê settings.json no arranque e mantém conexão ao :7890
+
     if pid is not None and process_uses_local_proxy(pid):
         return True
+
+    if pid is not None:
+        # Sessão rodando sem proxy — não herdar settings.json de outra sessão.
+        return False
+
+    if claude_settings_proxy_active():
+        return True
+
     return False

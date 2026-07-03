@@ -30,8 +30,11 @@ from proxy_manager.claude_proxy import (
     ANTHROPIC_API_HOST,
     claude_proxy_active,
     claude_proxy_reachable,
+    claude_session_stats,
     claude_settings_proxy_active,
+    ensure_claude_settings,
     is_claude_app,
+    list_claude_pids,
     prepare_claude_proxy,
 )
 from proxy_manager.config import ConfigStore
@@ -1293,18 +1296,17 @@ class ProxyManagerApp(ctk.CTk):
                 # pois o Claude lê o arquivo ao iniciar — não precisa estar ativo agora.
                 if is_claude_app(app):
                     if targets is not None and app.id in targets:
-                        # Estava rodando com proxy antes do switch → força enable
                         try:
-                            prepare_claude_proxy(self.store.proxy, use_proxy=True)
+                            ensure_claude_settings(self.store.proxy, use_proxy=True)
                             app.use_proxy = True
                             app.enabled = True
                             self.store.update_app(app)
                         except Exception:
                             pass
-                    elif app.use_proxy:
-                        # Não rodando mas usuário havia habilitado → mantém settings.json sync
+                    elif app.enabled or app.use_proxy:
                         try:
-                            prepare_claude_proxy(self.store.proxy, use_proxy=True)
+                            ensure_claude_settings(self.store.proxy, use_proxy=True)
+                            app.use_proxy = True
                             app.enabled = True
                             self.store.update_app(app)
                         except Exception:
@@ -1373,6 +1375,7 @@ class ProxyManagerApp(ctk.CTk):
             self._reapply_proxy_for_enabled_apps(
                 self._pending_reapply_app_ids or None
             )
+            self._ensure_claude_settings_if_enabled()
             self._apps_list_layout_key = None
             self._schedule_refresh_apps_list()
             self.after_idle(self._reload_proxy_form_from_store)
@@ -2614,6 +2617,39 @@ class ProxyManagerApp(ctk.CTk):
             "custom": "Proxy",
         }.get(self.store.proxy.source, "Proxy")
 
+    def _claude_restart_hint(self) -> str:
+        active, total = claude_session_stats()
+        if total == 0:
+            return "Abra um terminal e execute:\n  claude"
+        pending = total - active
+        if pending <= 0:
+            return "Todas as sessões já usam o proxy."
+        if pending == 1:
+            return (
+                "1 sessão ainda sem proxy.\n"
+                "Feche-a (Ctrl+D ou /exit) e abra de novo:\n  claude"
+            )
+        return (
+            f"{pending} de {total} sessões ainda sem proxy.\n"
+            "Feche cada uma (Ctrl+D ou /exit) e abra de novo:\n  claude"
+        )
+
+    def _ensure_claude_settings_if_enabled(self) -> None:
+        if not self._proxy_verified or not is_running():
+            return
+        app = self.store.get_app("claude")
+        if not app or not (app.enabled or app.use_proxy):
+            return
+        if claude_settings_proxy_active():
+            return
+        try:
+            if ensure_claude_settings(self.store.proxy, use_proxy=True):
+                app.use_proxy = True
+                app.enabled = True
+                self.store.update_app(app)
+        except Exception:
+            pass
+
     def _status_from_proc(
         self, proc: ProcessInfo | None, app: AppRule | None = None
     ) -> tuple[str, str]:
@@ -2639,11 +2675,39 @@ class ProxyManagerApp(ctk.CTk):
             ):
                 mode = self._proxy_mode_short_label()
                 return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
+            if app and is_claude_app(app) and self._proxy_verified and self.store.proxy.source != "direct":
+                active_sess, total_sess = claude_session_stats()
+                if total_sess > 0 and active_sess < total_sess:
+                    mode = self._proxy_mode_short_label()
+                    pending = total_sess - active_sess
+                    return (
+                        f"◐ {mode} parcial ({active_sess}/{total_sess})\n"
+                        f"(reinicie {pending} sessão"
+                        f"{'ões' if pending > 1 else ''})",
+                        "#fbbf24",
+                    )
             return "○ Rodando sem proxy", "#94a3b8"
         if app and self._proxy_verified and self.store.proxy.source != "direct":
             mode = self._proxy_mode_short_label()
-            if is_claude_app(app) and claude_settings_proxy_active():
-                return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
+            if is_claude_app(app):
+                active_sess, total_sess = claude_session_stats()
+                if total_sess > 0:
+                    if active_sess == total_sess:
+                        ip = self._ip_display_for_proxy_active()
+                        if ip and ip not in ("—", "…"):
+                            return f"● {mode} ativo ({total_sess} sess.)\nIP web: {ip}", "#4ade80"
+                        return f"● {mode} ativo ({total_sess} sess.)", "#4ade80"
+                    if active_sess > 0:
+                        pending = total_sess - active_sess
+                        return (
+                            f"◐ {mode} parcial ({active_sess}/{total_sess})\n"
+                            f"(reinicie {pending} sessão"
+                            f"{'ões' if pending > 1 else ''})",
+                            "#fbbf24",
+                        )
+                    return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
+                if claude_settings_proxy_active():
+                    return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
             if app.id == "firefox" and firefox_proxy_active():
                 return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
         return "○ Parado", "#64748b"
@@ -2718,10 +2782,16 @@ class ProxyManagerApp(ctk.CTk):
     def _app_has_verified_proxy(self, app_id: str, by_app: dict[str, ProcessInfo]) -> bool:
         if not self._proxy_verified:
             return False
+        app = self.store.get_app(app_id)
+        if app and is_claude_app(app):
+            if app.enabled or app.use_proxy or claude_settings_proxy_active():
+                active_sess, total_sess = claude_session_stats()
+                if total_sess > 0:
+                    return active_sess > 0
+                return bool(app.enabled or app.use_proxy or claude_settings_proxy_active())
         proc = by_app.get(app_id)
         if proc and proc.proxy_active:
             return True
-        app = self.store.get_app(app_id)
         if app and is_claude_app(app) and claude_settings_proxy_active():
             return True
         return False
@@ -3670,7 +3740,8 @@ class ProxyManagerApp(ctk.CTk):
             return
 
         try:
-            prepare_claude_proxy(self.store.proxy, use_proxy)
+            if not ensure_claude_settings(self.store.proxy, use_proxy):
+                raise OSError("settings.json não ficou com proxy após gravar")
         except OSError as exc:
             self._sync_app_toggle(app.id, False, persist=True)
             self._toast(f"Não foi possível gravar ~/.claude/settings.json:\n{exc}", "error")
@@ -3684,20 +3755,11 @@ class ProxyManagerApp(ctk.CTk):
         self._scanner.invalidate()
         self._request_scan(min_interval=0, debounce_ms=0)
 
-        running = find_process_for_app(
-            app, self.store.apps, self.store.proxy, self._scanner.cache
-        )
-        proxy_url = self.store.proxy.local_url
-
         if use_proxy:
-            restart_hint = (
-                "Feche a sessão atual (Ctrl+D ou /exit) e abra de novo no terminal:\n  claude"
-                if running
-                else "Abra um terminal e execute:\n  claude"
-            )
+            restart_hint = self._claude_restart_hint()
             self.status_label.configure(text=f"Claude Code: verificando acesso a {ANTHROPIC_API_HOST}…", text_color="#fbbf24")
 
-            def _test_and_show(hint: str = restart_hint, url: str = proxy_url) -> None:
+            def _test_and_show(hint: str = restart_hint, url: str = self.store.proxy.local_url) -> None:
                 ok, reach_msg = claude_proxy_reachable(timeout=8.0)
 
                 def _show() -> None:
@@ -3737,8 +3799,8 @@ class ProxyManagerApp(ctk.CTk):
             self._toast(
                 "Proxy removido de ~/.claude/settings.json. "
                 + (
-                    "Reinicie o Claude Code no terminal para aplicar."
-                    if running
+                    self._claude_restart_hint()
+                    if list_claude_pids()
                     else "Inicie o Claude Code normalmente quando quiser."
                 ),
                 "info",
