@@ -1489,7 +1489,8 @@ class ProxyManagerApp(ctk.CTk):
             tile = widgets["tile"]
             dot = widgets["dot"]
             proc = by_app.get(app_id)
-            _text, color = self._status_from_proc(proc)
+            app = self.store.get_app(app_id)
+            _text, color = self._status_from_proc(proc, app)
             dot.configure(text_color=color)
             truly_proxied = (
                 proc is not None
@@ -2612,7 +2613,9 @@ class ProxyManagerApp(ctk.CTk):
             "custom": "Proxy",
         }.get(self.store.proxy.source, "Proxy")
 
-    def _status_from_proc(self, proc: ProcessInfo | None) -> tuple[str, str]:
+    def _status_from_proc(
+        self, proc: ProcessInfo | None, app: AppRule | None = None
+    ) -> tuple[str, str]:
         if proc and proc.proxy_active:
             if self._auto_config_running or not self._proxy_verified:
                 return "◐ Verificando proxy…", "#fbbf24"
@@ -2636,14 +2639,12 @@ class ProxyManagerApp(ctk.CTk):
                 mode = self._proxy_mode_short_label()
                 return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
             return "○ Rodando sem proxy", "#94a3b8"
-        # Claude: proxy gravado em settings.json mas processo ainda não reiniciado
-        if (
-            self._proxy_verified
-            and self.store.proxy.source != "direct"
-            and claude_settings_proxy_active()
-        ):
+        if app and self._proxy_verified and self.store.proxy.source != "direct":
             mode = self._proxy_mode_short_label()
-            return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
+            if is_claude_app(app) and claude_settings_proxy_active():
+                return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
+            if app.id == "firefox" and firefox_proxy_active():
+                return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
         return "○ Parado", "#64748b"
 
     def _touch_recent_app(self, app: AppRule) -> None:
@@ -2746,7 +2747,7 @@ class ProxyManagerApp(ctk.CTk):
                     continue
             except Exception:
                 continue
-            text, color = self._status_from_proc(by_app.get(app_id))
+            text, color = self._status_from_proc(by_app.get(app_id), self.store.get_app(app_id))
             label.configure(text=text, text_color=color)
 
         for app_id, title in list(self._app_title_labels.items()):
@@ -2991,7 +2992,14 @@ class ProxyManagerApp(ctk.CTk):
             elif choice == "Remover":
                 self._remove_app(cur)
 
-        action_menu = ctk.CTkOptionMenu(card, values=[], command=on_action, width=110)
+        action_values = self._app_action_menu_values(app)
+        action_menu = ctk.CTkOptionMenu(
+            card,
+            values=action_values,
+            command=on_action,
+            width=110,
+        )
+        action_menu.set(action_values[0])
         action_menu.grid(row=0, column=4, rowspan=2, sticky="e", padx=(4, 12), pady=12)
 
         self._app_cards[app.id] = {
@@ -3003,6 +3011,15 @@ class ProxyManagerApp(ctk.CTk):
             "action_menu": action_menu,
         }
         self._refresh_app_card_content(app, self._app_cards[app.id], by_app)
+
+    def _app_action_menu_values(self, app: AppRule) -> list[str]:
+        values: list[str] = []
+        if app.command.strip():
+            values.append("Ligar proxy")
+        values.extend(["Parar proxy", "Editar"])
+        if app.category == "custom":
+            values.append("Remover")
+        return values
 
     def _refresh_app_card_content(
         self, app: AppRule, bundle: dict, by_app: dict[str, ProcessInfo]
@@ -3028,7 +3045,7 @@ class ProxyManagerApp(ctk.CTk):
 
         status_label = self._app_proxy_status.get(app.id)
         if status_label is not None:
-            status_txt, status_color = self._status_from_proc(proc)
+            status_txt, status_color = self._status_from_proc(proc, app)
             status_label.configure(text=status_txt, text_color=status_color)
 
         var = bundle.get("var")
@@ -3039,13 +3056,9 @@ class ProxyManagerApp(ctk.CTk):
 
         action_menu = bundle.get("action_menu")
         if action_menu is not None:
-            action_values: list[str] = []
-            if app.command.strip():
-                action_values.append("Ligar proxy")
-            action_values.extend(["Parar proxy", "Editar"])
-            if app.category == "custom":
-                action_values.append("Remover")
+            action_values = self._app_action_menu_values(app)
             action_menu.configure(values=action_values)
+            action_menu.set(action_values[0])
 
         self._apply_iface_highlight(bundle.get("iface_tiles"), app)
 
