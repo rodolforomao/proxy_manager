@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -14,6 +15,21 @@ BROWSER_COMMAND_CANDIDATES: dict[str, list[str]] = {
     "chrome": ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"],
     "firefox": ["firefox"],
 }
+
+# Cor usada para marcar visualmente a janela do navegador que está com proxy.
+PROXY_MARK_COLOR = "#f97316"
+
+_BROWSER_COUNTERPART: dict[str, str] = {
+    "chrome": "firefox",
+    "firefox": "chrome",
+}
+
+
+def browser_counterpart_id(app_id: str) -> str | None:
+    """Id do outro navegador gerido (chrome<->firefox), usado para abrir com proxy
+    sem mexer no navegador que já está aberto."""
+    return _BROWSER_COUNTERPART.get(app_id)
+
 
 # Apps Electron que também têm "chrome" no caminho — não são o navegador Google/Chromium.
 _CHROME_NOISE_MARKERS = (
@@ -167,6 +183,7 @@ def _firefox_user_js_block(host: str, port: int) -> str:
         f'user_pref("network.proxy.ssl_port", {port});\n'
         f'user_pref("network.proxy.share_proxy_settings", true);\n'
         f'user_pref("network.proxy.no_proxies_on", "localhost,127.0.0.1");\n'
+        f'user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);\n'
         f"{MARKER}-end\n"
     )
 
@@ -177,6 +194,33 @@ def _firefox_disable_block() -> str:
         f'user_pref("network.proxy.type", 0);\n'
         f"{MARKER}-end\n"
     )
+
+
+def _orange_user_chrome_css_block() -> str:
+    return (
+        f"{MARKER}\n"
+        f'#TabsToolbar, #nav-bar, #titlebar {{ background-color: {PROXY_MARK_COLOR} !important; }}\n'
+        f'#tabbrowser-tabs .tabbrowser-tab[selected="true"] .tab-background {{ background-color: {PROXY_MARK_COLOR} !important; }}\n'
+        f"{MARKER}-end\n"
+    )
+
+
+def _set_firefox_marking(profile_dir: Path, *, enabled: bool) -> None:
+    """Pinta a toolbar/abas de laranja via userChrome.css enquanto o proxy estiver ativo."""
+    chrome_dir = profile_dir / "chrome"
+    css_path = chrome_dir / "userChrome.css"
+    existing = css_path.read_text(encoding="utf-8", errors="replace") if css_path.exists() else ""
+    cleaned = _strip_managed_block(existing)
+
+    if enabled:
+        chrome_dir.mkdir(parents=True, exist_ok=True)
+        block = _orange_user_chrome_css_block()
+        css_path.write_text(cleaned + ("\n" if cleaned and not cleaned.endswith("\n") else "") + block, encoding="utf-8")
+    elif css_path.exists():
+        if cleaned.strip():
+            css_path.write_text(cleaned, encoding="utf-8")
+        else:
+            css_path.unlink(missing_ok=True)
 
 
 def set_firefox_proxy(profile_dir: Path, *, host: str, port: int, enabled: bool) -> None:
@@ -190,6 +234,8 @@ def set_firefox_proxy(profile_dir: Path, *, host: str, port: int, enabled: bool)
     else:
         block = _firefox_disable_block()
         user_js.write_text(cleaned + ("\n" if cleaned and not cleaned.endswith("\n") else "") + block, encoding="utf-8")
+
+    _set_firefox_marking(profile_dir, enabled=enabled)
 
 
 def firefox_proxy_active(profile_dir: Path | None = None, *, host: str = LOCAL_HOST, port: int = LOCAL_PORT) -> bool:
@@ -237,6 +283,81 @@ def browser_connects_local_proxy(app: AppRule, local_port: int = LOCAL_PORT) -> 
     return False
 
 
+def default_chrome_user_data_dir(app: AppRule) -> Path | None:
+    """Resolve o user-data-dir real do Chrome/Chromium instalado (snap ou pacote).
+
+    O nome da pasta de perfil dentro do user-data-dir varia (``Default``, ``Profile 1``,
+    ...), então a checagem usa o ``Local State`` (sempre na raiz do user-data-dir) em vez
+    de assumir um nome fixo de subpasta.
+    """
+    candidates = (
+        Path.home() / "snap/chromium/common/chromium",
+        Path.home() / "snap/google-chrome/common/config/google-chrome",
+        Path.home() / ".config/chromium",
+        Path.home() / ".config/google-chrome",
+    )
+    for path in candidates:
+        local_state = path / "Local State"
+        if not local_state.is_file():
+            continue
+        try:
+            data = json.loads(local_state.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if data.get("profile", {}).get("info_cache"):
+            return path
+    for path in candidates:
+        if path.is_dir():
+            return path
+    return None
+
+
+def _argb_signed(hex_color: str) -> int:
+    """Converte '#rrggbb' no inteiro ARGB signed 32-bit usado pelo Chrome em Local State."""
+    rgb = int(hex_color.lstrip("#"), 16)
+    value = 0xFF000000 | rgb
+    return value - 0x1_0000_0000 if value >= 0x8000_0000 else value
+
+
+_CHROME_COLOR_BACKUP_NAME = ".proxymgr-color-backup.json"
+_CHROME_MARK_FIELDS = ("profile_highlight_color", "profile_color_seed", "is_using_default_avatar", "name")
+
+
+def set_chrome_profile_marking(user_data_dir: Path, *, enabled: bool) -> None:
+    """Marca (ou restaura) a cor de perfil do Chrome/Chromium — melhor esforço, não
+    deve impedir o lançamento se o formato do Local State mudar entre versões."""
+    local_state_path = user_data_dir / "Local State"
+    backup_path = user_data_dir / _CHROME_COLOR_BACKUP_NAME
+    try:
+        if not local_state_path.is_file():
+            return
+        data = json.loads(local_state_path.read_text(encoding="utf-8", errors="replace"))
+        info_cache = data.get("profile", {}).get("info_cache", {})
+        if not info_cache:
+            return
+        profile_key = "Default" if "Default" in info_cache else next(iter(info_cache))
+        entry = info_cache[profile_key]
+
+        if enabled:
+            if not backup_path.exists():
+                backup = {k: entry.get(k) for k in _CHROME_MARK_FIELDS if k in entry}
+                backup_path.write_text(json.dumps(backup), encoding="utf-8")
+            entry["profile_highlight_color"] = _argb_signed(PROXY_MARK_COLOR)
+            entry["profile_color_seed"] = _argb_signed(PROXY_MARK_COLOR)
+            entry["is_using_default_avatar"] = False
+            entry["name"] = "Proxy"
+        elif backup_path.exists():
+            backup = json.loads(backup_path.read_text(encoding="utf-8", errors="replace"))
+            for key in _CHROME_MARK_FIELDS:
+                if key in backup:
+                    entry[key] = backup[key]
+            backup_path.unlink(missing_ok=True)
+
+        local_state_path.write_text(json.dumps(data), encoding="utf-8")
+    except (OSError, ValueError, KeyError):
+        pass
+
+
 def prepare_browser_proxy(app: AppRule, proxy: ProxySettings, use_proxy: bool) -> None:
     if app.id == "firefox":
         profile = default_firefox_profile_dir()
@@ -246,6 +367,10 @@ def prepare_browser_proxy(app: AppRule, proxy: ProxySettings, use_proxy: bool) -
                 "Abra o Firefox pelo menos uma vez ou configure manualmente em about:preferences."
             )
         set_firefox_proxy(profile, host=LOCAL_HOST, port=LOCAL_PORT, enabled=use_proxy)
+    elif app.id == "chrome":
+        user_data_dir = default_chrome_user_data_dir(app)
+        if user_data_dir is not None:
+            set_chrome_profile_marking(user_data_dir, enabled=use_proxy)
 
 
 def wrap_browser_command(

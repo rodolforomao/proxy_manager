@@ -18,6 +18,7 @@ from proxy_manager.version import window_title
 from proxy_manager.brand_icon import apply_window_icon
 from proxy_manager.browser_proxy import (
     browser_connects_local_proxy,
+    browser_counterpart_id,
     browser_is_running,
     browser_proxy_active,
     find_main_browser_pid,
@@ -3862,7 +3863,8 @@ class ProxyManagerApp(ctk.CTk):
         self._launch_app(app, use_proxy=True)
 
     def _start_browser_with_proxy(self, app: AppRule) -> None:
-        """Navegadores são single-instance: nunca abrir outro processo se já houver um rodando."""
+        """Nunca fecha um navegador que já está aberto: se o clicado já estiver rodando,
+        abre o outro navegador gerido (contraparte) com proxy no lugar, no perfil real dele."""
         resolved = resolve_browser_command(app)
         if not resolved or not shutil.which(resolved.split()[0]):
             self._sync_app_toggle(app.id, False, persist=True)
@@ -3885,54 +3887,78 @@ class ProxyManagerApp(ctk.CTk):
             return
 
         main_pid = find_main_browser_pid(app)
-        if main_pid is not None:
-            running = find_process_for_app(
-                app, self.store.apps, self.store.proxy, self._scanner.cache
-            )
-            if running and running.proxy_active:
-                self._toast(f"{app.name} já está rodando com proxy (PID {main_pid}).", "info")
-                self._sync_app_toggle(app.id, True)
-                return
-
-            browser_label = "Firefox" if app.id == "firefox" else app.name
-            detail = (
-                "O proxy será gravado no perfil (user.js) e o Firefox será fechado e reaberto."
-                if app.id == "firefox"
-                else "O navegador será fechado e reaberto com --proxy-server."
-            )
-            if not messagebox.askyesno(
-                f"{browser_label} já aberto",
-                f"{browser_label} já está rodando (PID {main_pid}).\n\n"
-                f"{detail}\n\n"
-                "Não é possível aplicar proxy só abrindo outra janela — "
-                "a instância atual continuaria sem proxy.\n\n"
-                "Reiniciar agora?",
-            ):
-                self._sync_app_toggle(app.id, False, persist=True)
-                return
-
-            try:
-                result = relaunch_process(
-                    main_pid,
-                    app=app,
-                    proxy=self.store.proxy,
-                    use_proxy=True,
-                    network_interface=app.network_interface,
-                )
-                app.use_proxy = True
-                app.enabled = True
-                self.store.update_app(app)
-                self._scanner.invalidate()
-                self._request_scan(min_interval=0, debounce_ms=0)
-                self._toast(
-                    f"{app.name} reiniciado com proxy. PID: {result.new_pid}",
-                    "success",
-                )
-            except Exception as exc:
-                self._sync_app_toggle(app.id, False, persist=True)
-                self._toast(str(exc), "error")
+        if main_pid is None:
+            self._launch_browser_directly(app, warnings)
             return
 
+        running = find_process_for_app(
+            app, self.store.apps, self.store.proxy, self._scanner.cache
+        )
+        if running and running.proxy_active:
+            self._toast(f"{app.name} já está rodando com proxy (PID {main_pid}).", "info")
+            self._sync_app_toggle(app.id, True)
+            return
+
+        counterpart_id = browser_counterpart_id(app.id)
+        counterpart = self.store.get_app(counterpart_id) if counterpart_id else None
+        if counterpart is not None:
+            counterpart_resolved = resolve_browser_command(counterpart)
+            counterpart_installed = bool(
+                counterpart_resolved and shutil.which(counterpart_resolved.split()[0])
+            )
+            if counterpart_installed and find_main_browser_pid(counterpart) is None:
+                self._sync_app_toggle(app.id, False, persist=True)
+                self._toast(
+                    f"{app.name} já está aberto — abrindo {counterpart.name} com proxy no lugar "
+                    "(janela marcada em laranja).",
+                    "info",
+                )
+                if counterpart_resolved != counterpart.command.strip():
+                    counterpart.command = counterpart_resolved
+                    self.store.update_app(counterpart)
+                self._launch_browser_directly(counterpart, warnings)
+                return
+
+        browser_label = "Firefox" if app.id == "firefox" else app.name
+        detail = (
+            "O proxy será gravado no perfil (user.js) e o Firefox será fechado e reaberto."
+            if app.id == "firefox"
+            else "O navegador será fechado e reaberto com --proxy-server."
+        )
+        if not messagebox.askyesno(
+            f"{browser_label} já aberto",
+            f"{browser_label} está rodando (PID {main_pid}) e não há outro navegador livre "
+            "para abrir com proxy sem interromper.\n\n"
+            f"{detail}\n\n"
+            "Reiniciar agora?",
+        ):
+            self._sync_app_toggle(app.id, False, persist=True)
+            return
+
+        try:
+            result = relaunch_process(
+                main_pid,
+                app=app,
+                proxy=self.store.proxy,
+                use_proxy=True,
+                network_interface=app.network_interface,
+            )
+            app.use_proxy = True
+            app.enabled = True
+            self.store.update_app(app)
+            self._scanner.invalidate()
+            self._request_scan(min_interval=0, debounce_ms=0)
+            self._toast(
+                f"{app.name} reiniciado com proxy. PID: {result.new_pid}",
+                "success",
+            )
+        except Exception as exc:
+            self._sync_app_toggle(app.id, False, persist=True)
+            self._toast(str(exc), "error")
+
+    def _launch_browser_directly(self, app: AppRule, warnings: list[str]) -> None:
+        """Lança um navegador que não está rodando, aplicando proxy no perfil real dele —
+        sem restart e sem tocar em nenhuma outra instância aberta."""
         if browser_is_running(app):
             self._sync_app_toggle(app.id, False, persist=True)
             self._toast(

@@ -1,3 +1,3 @@
 """Proxy Manager - controle de proxy por aplicativo."""
 
-__version__ = "0.01.005"
+__version__ = "1.00.000"
