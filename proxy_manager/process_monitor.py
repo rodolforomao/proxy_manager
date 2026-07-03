@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import psutil
 
-from proxy_manager.browser_proxy import browser_proxy_active, is_content_process
+from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, is_content_process, is_main_browser_process
 from proxy_manager.claude_proxy import claude_proxy_active
 from proxy_manager.models import AppRule, ProcessInfo, ProxySettings
 from proxy_manager.network import detect_process_interface
@@ -14,8 +14,6 @@ def _match_app(name: str, cmdline: str, apps: list[AppRule]) -> AppRule | None:
     best_score = -1
     haystack = f"{name} {cmdline}".lower()
     for app in apps:
-        if not app.enabled:
-            continue
         for pattern in app.patterns:
             p = pattern.lower()
             if p in haystack:
@@ -51,9 +49,13 @@ def scan_processes(
             matched = _match_app(name, cmdline, apps)
             if matched is None:
                 continue
+            if is_browser_app(matched) and not is_main_browser_process(matched, name, cmdline):
+                continue
 
             proxy_env = read_process_proxy_env(pid)
-            special_active = claude_proxy_active(matched, cmdline, proxy_env=proxy_env)
+            special_active = claude_proxy_active(
+                matched, cmdline, proxy_env=proxy_env, pid=pid
+            )
             if special_active is None:
                 special_active = browser_proxy_active(matched, cmdline)
             if special_active is not None:

@@ -54,6 +54,34 @@ def _local_proxy_url() -> str:
     return f"http://{LOCAL_HOST}:{LOCAL_PORT}"
 
 
+def _local_proxy_tcp_hex() -> tuple[str, str]:
+    """Endereço remoto 127.0.0.1:LOCAL_PORT em formato /proc/net/tcp."""
+    return "0100007F", f"{LOCAL_PORT:04X}"
+
+
+def process_uses_local_proxy(pid: int) -> bool:
+    """True se o processo tem conexão ESTABLISHED com o proxy local."""
+    host_hex, port_hex = _local_proxy_tcp_hex()
+    needle = f"{host_hex}:{port_hex}"
+    for fname in ("tcp", "tcp6"):
+        path = Path(f"/proc/{pid}/net/{fname}")
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            if parts[3] != "01":  # ESTABLISHED
+                continue
+            if parts[2].upper().startswith(needle):
+                return True
+    return False
+
+
 def claude_settings_proxy_active() -> bool:
     """True se settings.json aponta para o proxy local do Proxy Manager."""
     env = _load_settings().get("env")
@@ -131,9 +159,13 @@ def claude_proxy_reachable(timeout: float = 8.0) -> tuple[bool, str]:
 
 
 def claude_proxy_active(
-    app: AppRule, cmdline: str = "", proxy_env: dict[str, str] | None = None
+    app: AppRule,
+    cmdline: str = "",
+    proxy_env: dict[str, str] | None = None,
+    *,
+    pid: int | None = None,
 ) -> bool | None:
-    """Detecção de proxy para Claude Code (settings.json + env do processo)."""
+    """Detecção de proxy para Claude Code (settings.json, env, conexão TCP)."""
     del cmdline
     if not is_claude_app(app):
         return None
@@ -145,4 +177,7 @@ def claude_proxy_active(
         for key in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
             if proxy_env.get(key, "").strip() == needle:
                 return True
+    # Sessão já em uso: Claude lê settings.json no arranque e mantém conexão ao :7890
+    if pid is not None and process_uses_local_proxy(pid):
+        return True
     return False

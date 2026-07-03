@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from proxy_manager.browser_proxy import is_browser_app, prepare_browser_proxy, wrap_browser_command
+from proxy_manager.browser_proxy import is_browser_app, prepare_browser_proxy, resolve_browser_command, wrap_browser_command
 from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.models import AppRule, ProxySettings
 from proxy_manager.network import AUTO_INTERFACE
@@ -50,6 +50,9 @@ def launch_command(
         prepare_claude_proxy(proxy, use_proxy)
     elif app and is_browser_app(app):
         prepare_browser_proxy(app, proxy, use_proxy)
+        resolved = resolve_browser_command(app).split()
+        if resolved:
+            cmd = resolved
         cmd = wrap_browser_command(app, cmd, use_proxy=use_proxy)
 
     app_upstream = getattr(app, "upstream_proxy", "") if app else ""

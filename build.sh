@@ -6,7 +6,9 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 DIST="$ROOT/dist/proxy-manager"
 EXE="$DIST/proxy-manager"
-DESKTOP_FILE="$HOME/Desktop/proxy-manager.desktop"
+DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+DESKTOP_FILE="$DESKTOP_DIR/proxy-manager.desktop"
+APPS_DESKTOP="$HOME/.local/share/applications/proxy-manager.desktop"
 ICON_SRC="$ROOT/assets/icon.png"
 
 echo "==> Ativando ambiente virtual..."
@@ -57,15 +59,21 @@ echo "    Tamanho: $(du -sh "$DIST" | cut -f1)"
 
 # ── Atalho no Desktop ──────────────────────────────────────────────────────
 
-echo "==> Criando atalho no desktop..."
+echo "==> Instalando ícones e atalhos..."
 
-# Copia ícone para local padrão
-ICON_DEST="$HOME/.local/share/icons/hicolor/256x256/apps/proxy-manager.png"
-mkdir -p "$(dirname "$ICON_DEST")"
-cp "$ICON_SRC" "$ICON_DEST"
+python3 - <<PYEOF
+from pathlib import Path
+from proxy_manager.brand_icon import make_brand_icon
 
-cat > "$DESKTOP_FILE" <<DESKTOP
-[Desktop Entry]
+icons_base = Path.home() / ".local/share/icons/hicolor"
+for size in (16, 32, 48, 64, 128, 256):
+    icon_dir = icons_base / f"{size}x{size}/apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    make_brand_icon(size, proxy_on=True).save(str(icon_dir / "proxy-manager.png"))
+print("   ícones instalados (16–256px)")
+PYEOF
+
+DESKTOP_CONTENT="[Desktop Entry]
 Name=Proxy Manager
 Comment=Gerenciador de proxy por aplicativo
 Exec=$EXE
@@ -75,9 +83,12 @@ Categories=Network;Settings;
 StartupWMClass=proxy-manager
 StartupNotify=true
 Terminal=false
-DESKTOP
+"
 
-chmod +x "$DESKTOP_FILE"
+printf '%s' "$DESKTOP_CONTENT" > "$DESKTOP_FILE"
+mkdir -p "$(dirname "$APPS_DESKTOP")"
+printf '%s' "$DESKTOP_CONTENT" > "$APPS_DESKTOP"
+chmod +x "$DESKTOP_FILE" "$APPS_DESKTOP"
 
 # Marca como confiável no GNOME (evita o diálogo "arquivo não confiável")
 if command -v gio &>/dev/null; then
@@ -92,6 +103,7 @@ echo ""
 echo "✓ Build completo!"
 echo "  Executável : $EXE"
 echo "  Atalho     : $DESKTOP_FILE"
+echo "  Menu apps  : $APPS_DESKTOP"
 echo ""
 echo "  Para executar direto:"
 echo "    $EXE"

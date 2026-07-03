@@ -37,10 +37,12 @@ def _install_desktop_integration() -> None:
         # 2. Escreve .desktop file
         desktop_dir = Path.home() / ".local/share/applications"
         desktop_dir.mkdir(parents=True, exist_ok=True)
-        # Usa o python do venv atual (ou o sistema)
-        python_bin = sys.executable
-        run_script = _PROJECT_DIR / "run.sh"
-        exec_cmd = str(run_script) if run_script.exists() else f"{python_bin} {_PROJECT_DIR / 'main.py'}"
+        if getattr(sys, "frozen", False):
+            exec_cmd = sys.executable
+        else:
+            python_bin = sys.executable
+            run_script = _PROJECT_DIR / "run.sh"
+            exec_cmd = str(run_script) if run_script.exists() else f"{python_bin} {_PROJECT_DIR / 'main.py'}"
 
         desktop_content = f"""[Desktop Entry]
 Name=Proxy Manager

@@ -11,7 +11,7 @@ from proxy_manager.profiles import ProxyProfile
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CONFIG_VERSION = 12
+CONFIG_VERSION = 13
 RECENT_APPS_MAX = 20
 
 
@@ -144,6 +144,13 @@ class ConfigStore:
             pass  # upstream_proxy default ""
         if from_version < 12:
             pass  # network_interface default AUTO_INTERFACE
+        if from_version < 13:
+            for app in self.apps:
+                if app.id == "chrome":
+                    app.patterns = ["google-chrome", "chromium", "chromium-browser"]
+                    app.notes = (
+                        "Chrome ou Chromium — reinicia com --proxy-server apontando para o proxy local."
+                    )
 
     def touch_recent_app(self, app_id: str) -> None:
         recent = [aid for aid in self.recent_app_ids if aid != app_id]

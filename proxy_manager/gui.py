@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -14,11 +15,21 @@ from tkinter import messagebox, ttk
 from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, scan_installed_apps
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
 from proxy_manager.brand_icon import apply_window_icon
-from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, prepare_browser_proxy
+from proxy_manager.browser_proxy import (
+    browser_connects_local_proxy,
+    browser_is_running,
+    browser_proxy_active,
+    find_main_browser_pid,
+    firefox_proxy_active,
+    is_browser_app,
+    prepare_browser_proxy,
+    resolve_browser_command,
+)
 from proxy_manager.claude_proxy import (
     ANTHROPIC_API_HOST,
     claude_proxy_active,
     claude_proxy_reachable,
+    claude_settings_proxy_active,
     is_claude_app,
     prepare_claude_proxy,
 )
@@ -57,7 +68,7 @@ except ImportError:
 try:
     from proxy_manager.tray import ProxyTray, is_available as tray_available
     _TRAY_AVAILABLE = True
-except ImportError:
+except Exception:
     _TRAY_AVAILABLE = False
     def tray_available() -> bool: return False  # noqa: E704
     class ProxyTray:  # type: ignore[no-redef]
@@ -138,6 +149,7 @@ class ProxyManagerApp(ctk.CTk):
         self._app_proxy_status: dict[str, ctk.CTkLabel] = {}
         self._app_title_labels: dict[str, ctk.CTkLabel] = {}
         self._app_toggle_vars: dict[str, ctk.BooleanVar] = {}
+        self._app_cards: dict[str, dict] = {}
         self._toggle_syncing: set[str] = set()
         self._free_candidates: list[ProxyCandidate] = []
         self._settings_common_row = 0
@@ -2591,20 +2603,47 @@ class ProxyManagerApp(ctk.CTk):
         if is_running() and self._proxy_verified:
             self._maybe_fetch_public_ip(processes, force=False)
 
+    def _proxy_mode_short_label(self) -> str:
+        return {
+            "tor": "Tor",
+            "direct": "Direto",
+            "free": "Proxy",
+            "paid": "Pago",
+            "custom": "Proxy",
+        }.get(self.store.proxy.source, "Proxy")
+
     def _status_from_proc(self, proc: ProcessInfo | None) -> tuple[str, str]:
         if proc and proc.proxy_active:
             if self._auto_config_running or not self._proxy_verified:
                 return "◐ Verificando proxy…", "#fbbf24"
             if self.store.proxy.source == "direct":
                 return "○ Direto (sem proxy externo)", "#94a3b8"
+            mode = self._proxy_mode_short_label()
             ip = self._ip_display_for_proxy_active()
             if ip and ip != "—" and ip != "…":
-                return f"● Proxy ativo\nIP web: {ip}", "#4ade80"
+                return f"● {mode} ativo\nIP web: {ip}", "#4ade80"
             if self._proxy_ip_fetching:
-                return "● Proxy ativo\nIP web: …", "#fbbf24"
-            return "● Proxy ativo", "#4ade80"
+                return f"● {mode} ativo\nIP web: …", "#fbbf24"
+            return f"● {mode} ativo", "#4ade80"
         if proc:
+            if (
+                proc.matched_app
+                and is_browser_app(proc.matched_app)
+                and proc.matched_app.id == "firefox"
+                and firefox_proxy_active()
+                and not browser_connects_local_proxy(proc.matched_app)
+            ):
+                mode = self._proxy_mode_short_label()
+                return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
             return "○ Rodando sem proxy", "#94a3b8"
+        # Claude: proxy gravado em settings.json mas processo ainda não reiniciado
+        if (
+            self._proxy_verified
+            and self.store.proxy.source != "direct"
+            and claude_settings_proxy_active()
+        ):
+            mode = self._proxy_mode_short_label()
+            return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
         return "○ Parado", "#64748b"
 
     def _touch_recent_app(self, app: AppRule) -> None:
@@ -2678,7 +2717,12 @@ class ProxyManagerApp(ctk.CTk):
         if not self._proxy_verified:
             return False
         proc = by_app.get(app_id)
-        return bool(proc and proc.proxy_active)
+        if proc and proc.proxy_active:
+            return True
+        app = self.store.get_app(app_id)
+        if app and is_claude_app(app) and claude_settings_proxy_active():
+            return True
+        return False
 
     def _sync_app_toggle(
         self, app_id: str, proxy_active: bool, *, persist: bool = False
@@ -2721,7 +2765,7 @@ class ProxyManagerApp(ctk.CTk):
                 text=f"{app_icon(app.id)}  {app.name}{pid_part}",
                 text_color="#f8fafc" if proxy_active else "#64748b",
             )
-            self._sync_app_toggle(app_id, proxy_active, persist=True)
+            self._sync_app_toggle(app_id, proxy_active)
 
     def _update_apps_proxy_status_from(self, processes: list[ProcessInfo]) -> None:
         by_app = {p.matched_app.id: p for p in processes if p.matched_app}
@@ -2749,23 +2793,49 @@ class ProxyManagerApp(ctk.CTk):
         self._schedule_refresh_apps_list()
 
     def _clear_apps_scroll(self) -> None:
-        self._app_proxy_status.clear()
-        self._app_title_labels.clear()
-        self._app_toggle_vars.clear()
+        """Remove só o que não é reaproveitável (cabeçalhos de seção, avisos).
+        Os cards de app custam ~1s+ cada para reconstruir (widgets do
+        customtkinter) — ver [[project-proxy-app-card-cache]] — então ficam
+        vivos em `self._app_cards` e são só reposicionados/escondidos."""
+        card_widgets = {b["card"] for b in self._app_cards.values()}
         for child in list(self.apps_scroll.winfo_children()):
+            if child in card_widgets:
+                continue
             try:
                 child.destroy()
             except Exception:
                 pass
 
+    def _prune_app_cards(self, valid_ids: set[str]) -> None:
+        """Destrói e descarta cards de apps que não existem mais na store
+        (removidos pelo usuário) — evita vazamento dos widgets cacheados."""
+        for app_id in list(self._app_cards):
+            if app_id in valid_ids:
+                continue
+            bundle = self._app_cards.pop(app_id)
+            try:
+                bundle["card"].destroy()
+            except Exception:
+                pass
+            self._app_proxy_status.pop(app_id, None)
+            self._app_title_labels.pop(app_id, None)
+            self._app_toggle_vars.pop(app_id, None)
+
     def _refresh_apps_list_impl(self) -> None:
         self._apps_refresh_job = None
         self._apps_render_gen += 1
         gen = self._apps_render_gen
+
+        apps = list(self.store.apps)
+        self._prune_app_cards({a.id for a in apps})
         self._clear_apps_scroll()
+        for bundle in self._app_cards.values():
+            try:
+                bundle["card"].grid_remove()
+            except Exception:
+                pass
 
         filt = self.app_filter_var.get().strip().lower()
-        apps = list(self.store.apps)
         if filt:
             apps = [
                 a
@@ -2834,38 +2904,52 @@ class ProxyManagerApp(ctk.CTk):
             self.after(1, lambda g=gen: self._render_apps_chunk(g))
 
     def _render_app_card(self, app: AppRule, row: int, by_app: dict[str, ProcessInfo]) -> None:
+        cached = self._app_cards.get(app.id)
+        if cached is not None:
+            try:
+                exists = cached["card"].winfo_exists()
+            except Exception:
+                exists = False
+            if exists:
+                cached["app_box"][0] = app  # pode ter sido substituído por uma edição
+                cached["card"].grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+                self._refresh_app_card_content(app, cached, by_app)
+                return
+            self._app_cards.pop(app.id, None)
+
         card = ctk.CTkFrame(self.apps_scroll, corner_radius=8)
         card.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
         card.grid_columnconfigure(1, weight=1)
 
-        proc = by_app.get(app.id)
+        app_box: list[AppRule] = [app]
         proxy_active = self._app_has_verified_proxy(app.id, by_app)
         enabled_var = ctk.BooleanVar(value=proxy_active)
         self._app_toggle_vars[app.id] = enabled_var
 
         def on_enabled_change() -> None:
-            if app.id in self._toggle_syncing:
+            cur = app_box[0]
+            if cur.id in self._toggle_syncing:
                 return
             want = enabled_var.get()
             if want:
-                app.enabled = True
-                self.store.update_app(app)
-                self._touch_recent_app(app)
-                if app.command.strip():
-                    self._start_with_proxy(app)
+                cur.enabled = True
+                self.store.update_app(cur)
+                self._touch_recent_app(cur)
+                if cur.command.strip():
+                    self._start_with_proxy(cur)
                 else:
-                    self._sync_app_toggle(app.id, False, persist=True)
+                    self._sync_app_toggle(cur.id, False, persist=True)
                     self._toast(
-                        f"{app.name} não tem comando de lançamento. Use «Ligar proxy» ou configure um comando em Editar.",
+                        f"{cur.name} não tem comando de lançamento. Use «Ligar proxy» ou configure um comando em Editar.",
                         "warning",
                     )
                 return
 
             if not want:
-                app.enabled = False
-                self.store.update_app(app)
+                cur.enabled = False
+                self.store.update_app(cur)
                 self._apps_list_layout_key = None
-                self._stop_proxy(app, revert_toggle=enabled_var)
+                self._stop_proxy(cur, revert_toggle=enabled_var)
                 self._schedule_refresh_apps_list()
 
         ctk.CTkSwitch(
@@ -2876,36 +2960,17 @@ class ProxyManagerApp(ctk.CTk):
             command=on_enabled_change,
         ).grid(row=0, column=0, rowspan=2, padx=(12, 8), pady=12)
 
-        title_color = "#f8fafc" if proxy_active else "#64748b"
-        pid_part = f"  ·  PID {proc.pid}" if proc else ""
-        title_label = ctk.CTkLabel(
-            card,
-            text=f"{app_icon(app.id)}  {app.name}{pid_part}",
-            font=self._card_title_font,
-            text_color=title_color,
-        )
+        title_label = ctk.CTkLabel(card, text="", font=self._card_title_font)
         title_label.grid(row=0, column=1, sticky="w", pady=(10, 0))
         self._app_title_labels[app.id] = title_label
 
-        patterns_txt = ", ".join(app.patterns[:4])
-        if app.notes:
-            sub = f"{patterns_txt} — {app.notes}"
-        else:
-            sub = patterns_txt
-        ctk.CTkLabel(
-            card,
-            text=sub,
-            font=self._card_sub_font,
-            text_color="#94a3b8",
-        ).grid(row=1, column=1, sticky="w", pady=(0, 10))
-
-        status_txt, status_color = self._status_from_proc(proc)
+        sub_label = ctk.CTkLabel(card, text="", font=self._card_sub_font, text_color="#94a3b8")
+        sub_label.grid(row=1, column=1, sticky="w", pady=(0, 10))
 
         status_label = ctk.CTkLabel(
             card,
-            text=status_txt,
+            text="",
             font=self._card_status_font,
-            text_color=status_color,
             width=175,
             anchor="w",
             justify="left",
@@ -2913,49 +2978,105 @@ class ProxyManagerApp(ctk.CTk):
         status_label.grid(row=0, column=2, rowspan=2, padx=8, pady=12)
         self._app_proxy_status[app.id] = status_label
 
-        self._render_iface_selector(card, app, row=0, col=3)
-
-        action_values: list[str] = []
-        if app.command.strip():
-            action_values.append("Ligar proxy")
-        action_values.extend(["Parar proxy", "Editar"])
-        if app.category == "custom":
-            action_values.append("Remover")
+        iface_tiles = self._render_iface_selector(card, app_box, row=0, col=3)
 
         def on_action(choice: str) -> None:
+            cur = app_box[0]
             if choice == "Ligar proxy":
-                self._start_with_proxy(app)
+                self._start_with_proxy(cur)
             elif choice == "Parar proxy":
-                self._stop_proxy(app)
+                self._stop_proxy(cur)
             elif choice == "Editar":
-                self._edit_app_dialog(app)
+                self._edit_app_dialog(cur)
             elif choice == "Remover":
-                self._remove_app(app)
+                self._remove_app(cur)
 
-        ctk.CTkOptionMenu(
-            card,
-            values=action_values,
-            command=on_action,
-            width=110,
-        ).grid(row=0, column=4, rowspan=2, sticky="e", padx=(4, 12), pady=12)
+        action_menu = ctk.CTkOptionMenu(card, values=[], command=on_action, width=110)
+        action_menu.grid(row=0, column=4, rowspan=2, sticky="e", padx=(4, 12), pady=12)
+
+        self._app_cards[app.id] = {
+            "card": card,
+            "var": enabled_var,
+            "app_box": app_box,
+            "iface_tiles": iface_tiles,
+            "sub_label": sub_label,
+            "action_menu": action_menu,
+        }
+        self._refresh_app_card_content(app, self._app_cards[app.id], by_app)
+
+    def _refresh_app_card_content(
+        self, app: AppRule, bundle: dict, by_app: dict[str, ProcessInfo]
+    ) -> None:
+        """Atualiza o conteúdo de um card já existente (reaproveitado) sem
+        reconstruir nenhum widget — é o que torna o filtro/reordenação
+        instantâneos em vez de levar segundos por app. Ver [[project-proxy-app-card-cache]]."""
+        proc = by_app.get(app.id)
+        proxy_active = self._app_has_verified_proxy(app.id, by_app)
+
+        title_label = self._app_title_labels.get(app.id)
+        if title_label is not None:
+            pid_part = f"  ·  PID {proc.pid}" if proc else ""
+            title_label.configure(
+                text=f"{app_icon(app.id)}  {app.name}{pid_part}",
+                text_color="#f8fafc" if proxy_active else "#64748b",
+            )
+
+        sub_label = bundle.get("sub_label")
+        if sub_label is not None:
+            patterns_txt = ", ".join(app.patterns[:4])
+            sub_label.configure(text=f"{patterns_txt} — {app.notes}" if app.notes else patterns_txt)
+
+        status_label = self._app_proxy_status.get(app.id)
+        if status_label is not None:
+            status_txt, status_color = self._status_from_proc(proc)
+            status_label.configure(text=status_txt, text_color=status_color)
+
+        var = bundle.get("var")
+        if var is not None and app.id not in self._toggle_syncing:
+            self._toggle_syncing.add(app.id)
+            var.set(proxy_active)
+            self._toggle_syncing.discard(app.id)
+
+        action_menu = bundle.get("action_menu")
+        if action_menu is not None:
+            action_values: list[str] = []
+            if app.command.strip():
+                action_values.append("Ligar proxy")
+            action_values.extend(["Parar proxy", "Editar"])
+            if app.category == "custom":
+                action_values.append("Remover")
+            action_menu.configure(values=action_values)
+
+        self._apply_iface_highlight(bundle.get("iface_tiles"), app)
+
+    def _apply_iface_highlight(self, tiles: dict[str, ctk.CTkFrame] | None, app: AppRule) -> None:
+        if not tiles:
+            return
+        for n, t in tiles.items():
+            try:
+                active = n == app.network_interface
+                t.configure(
+                    border_color="#4ade80" if active else "#475569",
+                    fg_color="#1e3a2f" if active else "#334155",
+                )
+            except Exception:
+                pass
 
     _IFACE_ICONS = {AUTO_INTERFACE: "⚡", "wifi": "📶", "ethernet": "🔌", "other": "◎"}
 
-    def _render_iface_selector(self, parent: ctk.CTkFrame, app: AppRule, *, row: int, col: int) -> None:
+    def _render_iface_selector(
+        self, parent: ctk.CTkFrame, app_box: list[AppRule], *, row: int, col: int
+    ) -> dict[str, ctk.CTkFrame]:
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.grid(row=row, column=col, rowspan=2, padx=6, pady=6, sticky="ns")
 
         tiles: dict[str, ctk.CTkFrame] = {}
 
         def select(name: str) -> None:
-            app.network_interface = name
-            self.store.update_app(app)
-            for n, t in tiles.items():
-                active = n == app.network_interface
-                t.configure(
-                    border_color="#4ade80" if active else "#475569",
-                    fg_color="#1e3a2f" if active else "#334155",
-                )
+            cur = app_box[0]
+            cur.network_interface = name
+            self.store.update_app(cur)
+            self._apply_iface_highlight(tiles, cur)
 
         kind_count: dict[str, int] = {}
         for name, _ in self._iface_choices:
@@ -3007,12 +3128,8 @@ class ProxyManagerApp(ctk.CTk):
 
             tiles[name] = tile
 
-        for n, t in tiles.items():
-            active = n == app.network_interface
-            t.configure(
-                border_color="#4ade80" if active else "#475569",
-                fg_color="#1e3a2f" if active else "#334155",
-            )
+        self._apply_iface_highlight(tiles, app_box[0])
+        return tiles
 
     def _build_iface_tiles_widget(
         self, parent: ctk.CTkBaseClass, default_iface: str
@@ -3624,6 +3741,10 @@ class ProxyManagerApp(ctk.CTk):
             self._apply_claude_proxy(app, use_proxy=True)
             return
 
+        if is_browser_app(app):
+            self._start_browser_with_proxy(app)
+            return
+
         running = find_process_for_app(
             app, self.store.apps, self.store.proxy, self._scanner.cache
         )
@@ -3664,6 +3785,153 @@ class ProxyManagerApp(ctk.CTk):
 
         self._launch_app(app, use_proxy=True)
 
+    def _start_browser_with_proxy(self, app: AppRule) -> None:
+        """Navegadores são single-instance: nunca abrir outro processo se já houver um rodando."""
+        resolved = resolve_browser_command(app)
+        if not resolved or not shutil.which(resolved.split()[0]):
+            self._sync_app_toggle(app.id, False, persist=True)
+            hint = "chromium" if app.id == "chrome" else "firefox"
+            self._toast(
+                f"{app.name} não encontrado no sistema.\n"
+                f"Instale o navegador ou configure o comando em Editar.\n"
+                f"(procurado: {app.command or hint})",
+                "error",
+            )
+            return
+
+        if resolved != app.command.strip():
+            app.command = resolved
+            self.store.update_app(app)
+
+        warnings = self._ensure_proxy_for_launch()
+        if warnings is None:
+            self._sync_app_toggle(app.id, False, persist=True)
+            return
+
+        main_pid = find_main_browser_pid(app)
+        if main_pid is not None:
+            running = find_process_for_app(
+                app, self.store.apps, self.store.proxy, self._scanner.cache
+            )
+            if running and running.proxy_active:
+                self._toast(f"{app.name} já está rodando com proxy (PID {main_pid}).", "info")
+                self._sync_app_toggle(app.id, True)
+                return
+
+            browser_label = "Firefox" if app.id == "firefox" else app.name
+            detail = (
+                "O proxy será gravado no perfil (user.js) e o Firefox será fechado e reaberto."
+                if app.id == "firefox"
+                else "O navegador será fechado e reaberto com --proxy-server."
+            )
+            if not messagebox.askyesno(
+                f"{browser_label} já aberto",
+                f"{browser_label} já está rodando (PID {main_pid}).\n\n"
+                f"{detail}\n\n"
+                "Não é possível aplicar proxy só abrindo outra janela — "
+                "a instância atual continuaria sem proxy.\n\n"
+                "Reiniciar agora?",
+            ):
+                self._sync_app_toggle(app.id, False, persist=True)
+                return
+
+            try:
+                result = relaunch_process(
+                    main_pid,
+                    app=app,
+                    proxy=self.store.proxy,
+                    use_proxy=True,
+                    network_interface=app.network_interface,
+                )
+                app.use_proxy = True
+                app.enabled = True
+                self.store.update_app(app)
+                self._scanner.invalidate()
+                self._request_scan(min_interval=0, debounce_ms=0)
+                self._toast(
+                    f"{app.name} reiniciado com proxy. PID: {result.new_pid}",
+                    "success",
+                )
+            except Exception as exc:
+                self._sync_app_toggle(app.id, False, persist=True)
+                self._toast(str(exc), "error")
+            return
+
+        if browser_is_running(app):
+            self._sync_app_toggle(app.id, False, persist=True)
+            self._toast(
+                f"{app.name} parece estar aberto, mas não foi possível obter o PID.\n"
+                "Feche o navegador manualmente e tente de novo.",
+                "warning",
+            )
+            return
+
+        self._launch_app(app, use_proxy=True, launch_warnings=warnings)
+
+    def _stop_browser_proxy(self, app: AppRule, *, revert_toggle: ctk.BooleanVar | None = None) -> None:
+        main_pid = find_main_browser_pid(app)
+        running = find_process_for_app(
+            app, self.store.apps, self.store.proxy, self._scanner.cache
+        )
+        proxy_on = bool(
+            (running and running.proxy_active)
+            or (app.id == "firefox" and firefox_proxy_active())
+            or browser_connects_local_proxy(app)
+        )
+
+        if main_pid is not None and proxy_on:
+            if not messagebox.askyesno(
+                "Parar proxy",
+                f"{app.name} está com proxy (PID {main_pid}).\n\n"
+                "Reiniciar sem proxy? (o navegador será fechado e reaberto)",
+            ):
+                if revert_toggle is not None:
+                    self._toggle_syncing.add(app.id)
+                    revert_toggle.set(True)
+                    self._toggle_syncing.discard(app.id)
+                    app.enabled = True
+                    self.store.update_app(app)
+                return
+            try:
+                result = relaunch_process(
+                    main_pid,
+                    app=app,
+                    proxy=self.store.proxy,
+                    use_proxy=False,
+                    network_interface=app.network_interface,
+                )
+                app.use_proxy = False
+                app.enabled = False
+                self.store.update_app(app)
+                self._toast(f"Proxy removido de {app.name}. Novo PID: {result.new_pid}", "info")
+                self._refresh_apps_list()
+                self._refresh_all()
+            except Exception as exc:
+                self._toast(str(exc), "error")
+            return
+
+        if main_pid is not None:
+            try:
+                prepare_browser_proxy(app, self.store.proxy, use_proxy=False)
+            except Exception:
+                pass
+            app.use_proxy = False
+            app.enabled = False
+            self.store.update_app(app)
+            self._request_scan(min_interval=0, debounce_ms=0)
+            self._toast(
+                f"Proxy removido do perfil de {app.name}.\n"
+                f"Reinicie o navegador (PID {main_pid}) para aplicar.",
+                "info",
+            )
+            return
+
+        app.use_proxy = False
+        app.enabled = False
+        self.store.update_app(app)
+        self._request_scan(min_interval=0, debounce_ms=0)
+        self._toast(f"Proxy desligado para {app.name}.", "info")
+
     def _stop_proxy(self, app: AppRule, *, revert_toggle: ctk.BooleanVar | None = None) -> None:
         if is_claude_app(app):
             if revert_toggle is not None:
@@ -3678,6 +3946,10 @@ class ProxyManagerApp(ctk.CTk):
                     self.store.update_app(app)
                     return
             self._apply_claude_proxy(app, use_proxy=False)
+            return
+
+        if is_browser_app(app):
+            self._stop_browser_proxy(app, revert_toggle=revert_toggle)
             return
 
         running = find_process_for_app(
@@ -3724,21 +3996,45 @@ class ProxyManagerApp(ctk.CTk):
         else:
             self._toast(f"Proxy desligado para {app.name}. Inicie o app normalmente quando quiser.", "info")
 
-    def _launch_app(self, app: AppRule, *, use_proxy: bool) -> None:
-        warnings: list[str] = []
-        if use_proxy:
-            warnings = self._ensure_proxy_for_launch()
-            if warnings is None:
+    def _launch_app(
+        self,
+        app: AppRule,
+        *,
+        use_proxy: bool,
+        launch_warnings: list[str] | None = None,
+    ) -> None:
+        if is_browser_app(app) and browser_is_running(app):
+            self._sync_app_toggle(app.id, False, persist=True)
+            self._toast(
+                f"{app.name} já está aberto. Use o interruptor para reiniciar com proxy.",
+                "warning",
+            )
+            return
+
+        if launch_warnings is not None:
+            warnings = launch_warnings
+        elif use_proxy:
+            ensured = self._ensure_proxy_for_launch()
+            if ensured is None:
                 self._sync_app_toggle(app.id, False, persist=True)
                 return
+            warnings = ensured
+        else:
+            warnings = []
 
         try:
             from proxy_manager.launcher import launch_command
 
-            command = app.command.strip()
+            if is_browser_app(app):
+                command = resolve_browser_command(app)
+            else:
+                command = app.command.strip()
             if not command:
                 self._toast("Nenhum comando configurado para este app.", "warning")
                 return
+            if is_browser_app(app) and command != app.command.strip():
+                app.command = command
+                self.store.update_app(app)
             proc = launch_command(
                 command.split(),
                 proxy=self.store.proxy,

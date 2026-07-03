@@ -10,7 +10,7 @@ try:
     import pystray
     from PIL import Image
     _tray_available = True
-except ImportError:
+except Exception:
     pass
 
 

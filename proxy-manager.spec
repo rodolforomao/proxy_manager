@@ -35,6 +35,17 @@ hidden = [
     "tkinter.ttk",
     "tkinter.messagebox",
     "pystray",
+    # setuptools/pkg_resources (runtime hook pyi_rth_pkgres)
+    "platformdirs",
+    "jaraco.text",
+    "jaraco.functools",
+    "jaraco.context",
+    "more_itertools",
+    "packaging",
+    "packaging.version",
+    "packaging.requirements",
+    "packaging.specifiers",
+    "packaging.markers",
 ]
 
 a = Analysis(
@@ -70,6 +81,13 @@ a_worker = Analysis(
         "pproxy.server",
         "pproxy.cipher",
         "pproxy.plugin",
+        "platformdirs",
+        "jaraco.text",
+        "jaraco.functools",
+        "jaraco.context",
+        "more_itertools",
+        "packaging",
+        "packaging.version",
     ],
     hookspath=[],
     hooksconfig={},

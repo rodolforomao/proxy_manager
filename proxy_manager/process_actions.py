@@ -9,8 +9,10 @@ import psutil
 from proxy_manager.browser_proxy import (
     clear_firefox_profile_lock,
     is_browser_app,
+    is_main_browser_process,
     main_browser_command,
     prepare_browser_proxy,
+    resolve_browser_command,
 )
 from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.launcher import launch_command
@@ -76,8 +78,11 @@ def _alive_matching_pids(app: AppRule) -> list[int]:
                 continue
             name = info.get("name") or ""
             cmdline = " ".join(info.get("cmdline") or [])
-            if _matches_app(name, cmdline, app):
-                alive.append(info["pid"])
+            if not _matches_app(name, cmdline, app):
+                continue
+            if is_browser_app(app) and not is_main_browser_process(app, name, cmdline):
+                continue
+            alive.append(info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return alive
@@ -88,6 +93,11 @@ def terminate_app_tree(app: AppRule, timeout: float = 12.0) -> None:
         import subprocess
 
         subprocess.run(["pkill", "-9", "-f", "firefox"], check=False)
+    elif app.id == "chrome":
+        import subprocess
+
+        for pattern in ("chromium", "google-chrome", "chrome"):
+            subprocess.run(["pkill", "-9", "-f", pattern], check=False)
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -127,6 +137,9 @@ def relaunch_process(
     elif app and is_browser_app(app):
         cmd = main_browser_command(app, cmd)
         prepare_browser_proxy(app, proxy, use_proxy)
+        resolved = resolve_browser_command(app).split()
+        if resolved:
+            cmd = resolved
 
     base_env: dict[str, str] | None = None
     if not terminate_first:

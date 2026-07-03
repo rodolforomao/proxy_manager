@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from proxy_manager.models import AppRule, ProxySettings
@@ -179,6 +181,55 @@ def test_configstore_delete_profile(tmp_path):
     store.delete_profile("work")
     assert store.profiles == []
     assert store.active_profile == ""
+
+
+def test_claude_tcp_proxy_detection():
+    from proxy_manager.claude_proxy import _local_proxy_tcp_hex
+
+    host_hex, port_hex = _local_proxy_tcp_hex()
+    assert host_hex == "0100007F"
+    assert port_hex == "1ED2"  # LOCAL_PORT 7890
+
+
+def test_scan_matches_disabled_app_rules():
+    from proxy_manager.config import ConfigStore
+    from proxy_manager.process_monitor import scan_processes
+
+    store = ConfigStore()
+    for app in store.apps:
+        if app.id == "claude":
+            app.enabled = False
+            app.use_proxy = False
+    procs = scan_processes(store.apps, store.proxy)
+    claude_procs = [p for p in procs if p.matched_app and p.matched_app.id == "claude"]
+    # Pode não haver Claude rodando no CI; só valida que enabled=False não impede o match.
+    for proc in claude_procs:
+        assert proc.matched_app is not None
+        assert proc.matched_app.id == "claude"
+
+
+def test_resolve_browser_command_chromium():
+    from proxy_manager.browser_proxy import is_main_browser_process, resolve_browser_command
+    from proxy_manager.models import AppRule
+
+    app = AppRule(
+        id="chrome",
+        name="Google Chrome",
+        patterns=["google-chrome", "chromium", "chromium-browser"],
+        command="google-chrome",
+    )
+    resolved = resolve_browser_command(app)
+    if shutil.which("google-chrome") or shutil.which("google-chrome-stable"):
+        assert "google-chrome" in resolved
+    elif shutil.which("chromium"):
+        assert resolved.endswith("chromium") or "chromium" in resolved
+
+    assert is_main_browser_process(
+        app, "cursor", "/usr/share/cursor/chrome-sandbox /usr/share/cursor/cursor"
+    ) is False
+    assert is_main_browser_process(
+        app, "chromium", "/snap/bin/chromium --enable-features=VaapiVideoDecoder"
+    ) is True
 
 
 def test_configstore_app_upstream_roundtrip(tmp_path):

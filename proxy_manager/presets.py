@@ -34,11 +34,11 @@ def default_apps() -> list[AppRule]:
         AppRule(
             id="chrome",
             name="Google Chrome",
-            patterns=["chrome", "google-chrome"],
+            patterns=["google-chrome", "chromium", "chromium-browser"],
             use_proxy=False,
             category="browser",
             command="google-chrome",
-            notes="Reinicia com --proxy-server apontando para o proxy local.",
+            notes="Chrome ou Chromium — reinicia com --proxy-server apontando para o proxy local.",
         ),
         AppRule(
             id="firefox",
