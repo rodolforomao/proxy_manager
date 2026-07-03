@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 
 from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, scan_installed_apps
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
+from proxy_manager.version import window_title
 from proxy_manager.brand_icon import apply_window_icon
 from proxy_manager.browser_proxy import (
     browser_connects_local_proxy,
@@ -187,7 +188,7 @@ class ProxyManagerApp(ctk.CTk):
         self._apps_loading_label: ctk.CTkLabel | None = None
         self._APPS_RENDER_BATCH = 3
 
-        self.title("Proxy Manager")
+        self.title(window_title())
         self.geometry("1100x720")
         self.minsize(900, 600)
         self._update_brand_icon()

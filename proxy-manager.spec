@@ -15,6 +15,10 @@ assets_dir = ROOT / "assets"
 if assets_dir.exists():
     datas += [(str(assets_dir), "assets")]
 
+version_file = ROOT / "proxy_manager" / "_version.txt"
+if version_file.exists():
+    datas += [(str(version_file), "proxy_manager")]
+
 hidden = [
     *collect_submodules("proxy_manager"),
     "PIL._tkinter_finder",

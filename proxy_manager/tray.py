@@ -4,6 +4,7 @@ import threading
 from typing import Callable
 
 from proxy_manager.brand_icon import make_tray_icon
+from proxy_manager.version import app_version
 
 _tray_available = False
 try:
@@ -80,11 +81,12 @@ class ProxyTray:
         return self._status != "grey"
 
     def _title(self) -> str:
+        ver = app_version()
         if not self._proxy_on():
-            return "Proxy Manager — desligado"
+            return f"Proxy Manager {ver} — desligado"
         mode_label = _MODE_LABELS.get(self._mode, "ativo")
         status_label = _STATUS_LABELS.get(self._status, "")
-        return f"Proxy Manager — {mode_label} ({status_label})"
+        return f"Proxy Manager {ver} — {mode_label} ({status_label})"
 
     def _build_menu(self) -> "pystray.Menu":
         label_toggle = "Desligar proxy" if self._proxy_on() else "Ligar proxy"

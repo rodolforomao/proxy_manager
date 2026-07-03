@@ -26,6 +26,9 @@ if ! python -m PyInstaller --version &>/dev/null; then
 fi
 
 echo "==> Gerando ícone..."
+VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
+echo "$VERSION" > proxy_manager/_version.txt
+echo "   versão: $VERSION"
 python3 - <<'PYEOF'
 from proxy_manager.brand_icon import make_brand_icon
 from pathlib import Path
