@@ -1,15 +1,93 @@
 #!/usr/bin/env bash
 # build.sh — compila Proxy Manager em executável e cria atalho no desktop
+#
+# Versão (na ordem):
+#   ./build.sh 0.01.004
+#   ./build.sh --version 0.01.004
+#   VERSION=0.01.004 ./build.sh
+#   última tag git (git describe --tags --abbrev=0)
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
+
+resolve_build_version() {
+    if [[ -n "${VERSION:-}" ]]; then
+        echo "$VERSION"
+        return
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version|-v)
+                [[ $# -ge 2 ]] || { echo "ERRO: --version requer um valor" >&2; exit 1; }
+                echo "$2"
+                return
+                ;;
+            --version=*)
+                echo "${1#*=}"
+                return
+                ;;
+            -h|--help)
+                sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+                exit 0
+                ;;
+            --*)
+                shift
+                ;;
+            *)
+                echo "$1"
+                return
+                ;;
+        esac
+        shift
+    done
+    if git describe --tags --abbrev=0 &>/dev/null; then
+        git describe --tags --abbrev=0
+        return
+    fi
+    if git describe --tags --always &>/dev/null; then
+        git describe --tags --always
+        return
+    fi
+    echo "dev"
+}
+
+configure_version() {
+    local ver="$1"
+    python3 - "$ver" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+version = sys.argv[1]
+root = Path("proxy_manager")
+(root / "_version.txt").write_text(version + "\n", encoding="utf-8")
+init_py = root / "__init__.py"
+text = init_py.read_text(encoding="utf-8")
+text, n = re.subn(
+    r'__version__\s*=\s*["\'][^"\']*["\']',
+    f'__version__ = "{version}"',
+    text,
+    count=1,
+)
+if n == 0:
+    raise SystemExit("ERRO: __version__ não encontrado em proxy_manager/__init__.py")
+init_py.write_text(text, encoding="utf-8")
+print(f"   versão configurada: {version}")
+PY
+}
+
+APP_VERSION="$(resolve_build_version "$@")"
+
 DIST="$ROOT/dist/proxy-manager"
 EXE="$DIST/proxy-manager"
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
 DESKTOP_FILE="$DESKTOP_DIR/proxy-manager.desktop"
 APPS_DESKTOP="$HOME/.local/share/applications/proxy-manager.desktop"
 ICON_SRC="$ROOT/assets/icon.png"
+
+echo "==> Configurando versão..."
+configure_version "$APP_VERSION"
 
 echo "==> Ativando ambiente virtual..."
 if [[ -d .venv ]]; then
@@ -26,9 +104,6 @@ if ! python -m PyInstaller --version &>/dev/null; then
 fi
 
 echo "==> Gerando ícone..."
-VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
-echo "$VERSION" > proxy_manager/_version.txt
-echo "   versão: $VERSION"
 python3 - <<'PYEOF'
 from proxy_manager.brand_icon import make_brand_icon
 from pathlib import Path
@@ -78,7 +153,7 @@ PYEOF
 
 DESKTOP_CONTENT="[Desktop Entry]
 Name=Proxy Manager
-Comment=Gerenciador de proxy por aplicativo
+Comment=Gerenciador de proxy por aplicativo ($APP_VERSION)
 Exec=$EXE
 Icon=proxy-manager
 Type=Application
@@ -103,7 +178,7 @@ update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
 gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo ""
-echo "✓ Build completo!"
+echo "✓ Build completo!  v$APP_VERSION"
 echo "  Executável : $EXE"
 echo "  Atalho     : $DESKTOP_FILE"
 echo "  Menu apps  : $APPS_DESKTOP"

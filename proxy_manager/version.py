@@ -1,4 +1,4 @@
-"""Versão do app — última tag git (gravada no build) ou consulta git em dev."""
+"""Versão do app — configurada pelo build.sh ou última tag git em dev."""
 
 from __future__ import annotations
 
@@ -7,16 +7,25 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-_VERSION_FILE = Path(__file__).with_name("_version.txt")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _version_file_candidates() -> list[Path]:
+    paths: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(meipass) / "proxy_manager" / "_version.txt")
+    paths.append(Path(__file__).with_name("_version.txt"))
+    return paths
 
 
 @lru_cache(maxsize=1)
 def app_version() -> str:
-    if _VERSION_FILE.is_file():
-        text = _VERSION_FILE.read_text(encoding="utf-8").strip()
-        if text:
-            return text
+    for path in _version_file_candidates():
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
 
     if not getattr(sys, "frozen", False):
         try:
