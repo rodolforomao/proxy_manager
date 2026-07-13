@@ -171,6 +171,7 @@ SVC_SCANNER    = "scanner"
 SVC_TOR        = "tor"
 SVC_IFACE      = "iface_refresh"
 SVC_TRAY       = "tray"
+SVC_SSH_SOCKS  = "ssh_socks"
 
 # Pré-registra os serviços conhecidos
 register(SVC_GOST,       "Proxy local (gost)")
@@ -180,4 +181,5 @@ register(SVC_SCANNER,    "Scanner de processos")
 register(SVC_TOR,        "Tor")
 register(SVC_IFACE,      "Refresh de interfaces")
 register(SVC_TRAY,       "Bandeja do sistema")
+register(SVC_SSH_SOCKS,  "Túnel SOCKS5 (SSH)")
 register("ui",           "Interface")

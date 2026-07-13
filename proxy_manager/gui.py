@@ -123,6 +123,7 @@ from proxy_manager.proxy_sources import (
     try_start_tor,
     verify_local_proxy_chain,
 )
+from proxy_manager import ssh_socks_tunnel as ssh_socks
 
 
 CATEGORY_LABELS = {
@@ -193,8 +194,8 @@ class ProxyManagerApp(ctk.CTk):
         self._APPS_RENDER_BATCH = 3
 
         self.title(window_title())
-        self.geometry("1100x720")
-        self.minsize(900, 600)
+        self.geometry("1280x760")
+        self.minsize(1100, 680)
         self._update_brand_icon()
         self.bind("<Unmap>", self._on_unmap)
 
@@ -607,43 +608,116 @@ class ProxyManagerApp(ctk.CTk):
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        header.grid_columnconfigure(1, weight=1)
+        header.grid_columnconfigure(0, weight=1)
+
+        # ── Linha 0: título + IPs ────────────────────────────────────────────
+        top = ctk.CTkFrame(header, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            header,
+            top,
             text="Proxy Manager",
-            font=ctk.CTkFont(size=24, weight="bold"),
+            font=ctk.CTkFont(size=22, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
 
+        self.ip_frame = ctk.CTkFrame(top, fg_color="transparent")
+        self.ip_frame.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        _ip_lbl = ctk.CTkFont(size=11)
+        _ip_val = ctk.CTkFont(size=13, weight="bold")
+        _cc_font = ctk.CTkFont(size=11, weight="bold")
+
+        orig_blk = ctk.CTkFrame(self.ip_frame, fg_color="transparent")
+        orig_blk.pack(side="left")
+        ctk.CTkLabel(orig_blk, text="IP original", font=_ip_lbl, text_color="#64748b").pack(
+            side="top", anchor="e"
+        )
+        orig_row = ctk.CTkFrame(orig_blk, fg_color="transparent")
+        orig_row.pack(side="top", anchor="e")
+        self.direct_ip_label = ctk.CTkLabel(
+            orig_row, text="…", font=_ip_val, text_color="#cbd5e1"
+        )
+        self.direct_ip_label.pack(side="left")
+        self.direct_country_label = ctk.CTkLabel(
+            orig_row,
+            text="",
+            font=_cc_font,
+            text_color="#475569",
+            fg_color="#1e293b",
+            corner_radius=4,
+            padx=4,
+            pady=1,
+        )
+        self._direct_country_tooltip = Tooltip(self.direct_country_label)
+
+        self._ip_divider = ctk.CTkLabel(
+            self.ip_frame, text="│", font=ctk.CTkFont(size=22), text_color="#1e293b"
+        )
+        self._ip_divider.pack(side="left", padx=12)
+
+        self._proxy_ip_block = ctk.CTkFrame(self.ip_frame, fg_color="transparent")
+        self.proxy_ip_title = ctk.CTkLabel(
+            self._proxy_ip_block, text="Proxy", font=_ip_lbl, text_color="#64748b"
+        )
+        self.proxy_ip_title.pack(side="top", anchor="e")
+        proxy_row = ctk.CTkFrame(self._proxy_ip_block, fg_color="transparent")
+        proxy_row.pack(side="top", anchor="e")
+        self.proxy_ip_label = ctk.CTkLabel(
+            proxy_row, text="", font=_ip_val, text_color="#4ade80"
+        )
+        self.proxy_ip_label.pack(side="left")
+        self.proxy_country_label = ctk.CTkLabel(
+            proxy_row,
+            text="",
+            font=_cc_font,
+            text_color="#4ade80",
+            fg_color="#1e3a2f",
+            corner_radius=4,
+            padx=4,
+            pady=1,
+        )
+        self._proxy_country_tooltip = Tooltip(self.proxy_country_label)
+
+        # ── Linha 1: controles (duas fileiras, largura total) ────────────────
         controls = ctk.CTkFrame(header, fg_color="transparent")
-        controls.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        controls.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        row1 = ctk.CTkFrame(controls, fg_color="transparent")
+        row1.pack(side="top", fill="x")
 
         self.global_proxy_var = ctk.BooleanVar(
             value=self.store.proxy.enabled and is_running()
         )
         self.global_proxy_switch = ctk.CTkSwitch(
-            controls,
+            row1,
             text="PROXY DESLIGADO",
             variable=self.global_proxy_var,
             command=self._toggle_global_proxy,
-            font=ctk.CTkFont(size=15, weight="bold"),
-            width=200,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=190,
         )
-        self.global_proxy_switch.pack(side="left", padx=(0, 12))
+        self.global_proxy_switch.pack(side="left", padx=(0, 10))
         self._sync_global_switch_label()
 
-        mode_bar = ctk.CTkFrame(controls, fg_color="transparent")
+        mode_bar = ctk.CTkFrame(row1, fg_color="transparent")
         mode_bar.pack(side="left")
         self._build_mode_header_buttons(mode_bar)
         self._sync_auto_mode_header()
 
-        self._iface_bar = ctk.CTkFrame(controls, fg_color="transparent")
-        self._iface_bar.pack(side="left", padx=(10, 0))
+        self._build_ssh_socks_tile(row1)
+        self.after(300, self._sync_ssh_socks_button)
+
+        self._iface_bar = ctk.CTkFrame(row1, fg_color="transparent")
+        self._iface_bar.pack(side="left", padx=(8, 0))
         self._iface_header_tiles: dict[str, ctk.CTkFrame] = {}
         self._build_iface_header_tiles(self._iface_bar)
 
-        country_bar = ctk.CTkFrame(controls, fg_color="transparent")
-        country_bar.pack(side="left", padx=(10, 0))
+        row2 = ctk.CTkFrame(controls, fg_color="transparent")
+        row2.pack(side="top", fill="x", pady=(8, 0))
+
+        country_bar = ctk.CTkFrame(row2, fg_color="transparent")
+        country_bar.pack(side="left")
         ctk.CTkLabel(
             country_bar,
             text="País:",
@@ -657,24 +731,9 @@ class ProxyManagerApp(ctk.CTk):
             country_bar,
             values=country_option_labels(),
             variable=self.target_country_var,
-            width=190,
+            width=160,
             command=self._on_target_country_changed,
         ).pack(side="left")
-
-        reset_btn = ctk.CTkButton(
-            controls,
-            text="⚠ Resetar tudo",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#7f1d1d",
-            hover_color="#991b1b",
-            text_color="#fca5a5",
-            width=120,
-            height=32,
-            corner_radius=8,
-            command=self._emergency_reset,
-        )
-        reset_btn.pack(side="left", padx=(18, 0))
-        Tooltip(reset_btn, "Para tudo e remove proxy de todos os apps.\nUse se o sistema ficar travado sem internet.")
         Tooltip(
             country_bar,
             "⚡ Rápido: proxy público no país escolhido\n"
@@ -682,64 +741,33 @@ class ProxyManagerApp(ctk.CTk):
             "Saída Tor por país — em breve",
         )
 
-        # ── IP header (row 0, direita) ──────────────────────────────────────
-        self.ip_frame = ctk.CTkFrame(header, fg_color="transparent")
-        self.ip_frame.grid(row=0, column=1, sticky="e", padx=(12, 4), pady=(0, 4))
-
-        _ip_lbl  = ctk.CTkFont(size=11)
-        _ip_val  = ctk.CTkFont(size=13, weight="bold")
-        _cc_font = ctk.CTkFont(size=11, weight="bold")
-
-        # — Original IP ——————————————————————————————
-        orig_blk = ctk.CTkFrame(self.ip_frame, fg_color="transparent")
-        orig_blk.pack(side="left", padx=(0, 0))
-
-        ctk.CTkLabel(orig_blk, text="IP original", font=_ip_lbl,
-                     text_color="#64748b").pack(side="top", anchor="e")
-
-        orig_row = ctk.CTkFrame(orig_blk, fg_color="transparent")
-        orig_row.pack(side="top", anchor="e")
-        self.direct_ip_label = ctk.CTkLabel(orig_row, text="…", font=_ip_val,
-                                            text_color="#cbd5e1")
-        self.direct_ip_label.pack(side="left")
-        self.direct_country_label = ctk.CTkLabel(orig_row, text="", font=_cc_font,
-                                                 text_color="#475569",
-                                                 fg_color="#1e293b", corner_radius=4,
-                                                 padx=4, pady=1)
-        self._direct_country_tooltip = Tooltip(self.direct_country_label)
-
-        # — Divider ———————————————————————————————————
-        self._ip_divider = ctk.CTkLabel(self.ip_frame, text="│",
-                                        font=ctk.CTkFont(size=22),
-                                        text_color="#1e293b")
-        self._ip_divider.pack(side="left", padx=14)
-
-        # — Proxy IP ——————————————————————————————————
-        self._proxy_ip_block = ctk.CTkFrame(self.ip_frame, fg_color="transparent")
-        # (shown/hidden in _update_ip_display)
-
-        self.proxy_ip_title = ctk.CTkLabel(self._proxy_ip_block, text="Proxy",
-                                           font=_ip_lbl, text_color="#64748b")
-        self.proxy_ip_title.pack(side="top", anchor="e")
-
-        proxy_row = ctk.CTkFrame(self._proxy_ip_block, fg_color="transparent")
-        proxy_row.pack(side="top", anchor="e")
-        self.proxy_ip_label = ctk.CTkLabel(proxy_row, text="", font=_ip_val,
-                                           text_color="#4ade80")
-        self.proxy_ip_label.pack(side="left")
-        self.proxy_country_label = ctk.CTkLabel(proxy_row, text="", font=_cc_font,
-                                                text_color="#4ade80",
-                                                fg_color="#1e3a2f", corner_radius=4,
-                                                padx=4, pady=1)
-        self._proxy_country_tooltip = Tooltip(self.proxy_country_label)
+        reset_btn = ctk.CTkButton(
+            row2,
+            text="⚠ Resetar",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            text_color="#fca5a5",
+            width=100,
+            height=30,
+            corner_radius=8,
+            command=self._emergency_reset,
+        )
+        reset_btn.pack(side="left", padx=(12, 0))
+        Tooltip(
+            reset_btn,
+            "Para tudo e remove proxy de todos os apps.\n"
+            "Use se o sistema ficar travado sem internet.",
+        )
 
         self.status_label = ctk.CTkLabel(
-            header,
+            row2,
             text="",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=12),
             text_color="#94a3b8",
+            anchor="e",
         )
-        self.status_label.grid(row=1, column=1, sticky="e", padx=12, pady=(8, 0))
+        self.status_label.pack(side="right", padx=(12, 0))
 
         self._n_apps_proxy = 0
         self._build_proxy_info_bar(header)
@@ -761,9 +789,8 @@ class ProxyManagerApp(ctk.CTk):
     # ── Proxy info bar ───────────────────────────────────────────────────────
 
     def _build_proxy_info_bar(self, header: ctk.CTkFrame) -> None:
-        bar = ctk.CTkFrame(header, fg_color="#0f172a", corner_radius=8, height=36)
-        bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=0, pady=(6, 0))
-        bar.grid_propagate(False)
+        bar = ctk.CTkFrame(header, fg_color="#0f172a", corner_radius=8)
+        bar.grid(row=2, column=0, sticky="ew", padx=0, pady=(8, 0))
         self._proxy_info_bar = bar
 
         _lf = ctk.CTkFont(size=9, weight="bold")
@@ -773,34 +800,55 @@ class ProxyManagerApp(ctk.CTk):
         _dim = "#334155"
         _muted = "#475569"
 
-        self._pib_dot = ctk.CTkLabel(bar, text="●", font=ctk.CTkFont(size=15), text_color=_muted)
-        self._pib_dot.pack(side="left", padx=(12, 6), pady=0)
+        left = ctk.CTkFrame(bar, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=6)
 
-        ctk.CTkLabel(bar, text="LOCAL", font=_lf, text_color=_muted).pack(side="left", pady=0)
-        self._pib_local = ctk.CTkLabel(bar, text=f"127.0.0.1:{LOCAL_PORT}", font=_vf, text_color="#64748b")
-        self._pib_local.pack(side="left", padx=(3, 8), pady=0)
+        self._pib_dot = ctk.CTkLabel(left, text="●", font=ctk.CTkFont(size=15), text_color=_muted)
+        self._pib_dot.pack(side="left", padx=(2, 6))
 
-        ctk.CTkLabel(bar, text="→", font=_divf, text_color=_dim).pack(side="left", pady=0)
+        ctk.CTkLabel(left, text="LOCAL", font=_lf, text_color=_muted).pack(side="left")
+        self._pib_local = ctk.CTkLabel(
+            left, text=f"127.0.0.1:{LOCAL_PORT}", font=_vf, text_color="#64748b"
+        )
+        self._pib_local.pack(side="left", padx=(3, 8))
 
-        ctk.CTkLabel(bar, text="UPSTREAM", font=_lf, text_color=_muted).pack(side="left", padx=(8, 3), pady=0)
-        self._pib_upstream = ctk.CTkLabel(bar, text="—", font=_vf, text_color="#64748b")
-        self._pib_upstream.pack(side="left", padx=(0, 10), pady=0)
+        ctk.CTkLabel(left, text="→", font=_divf, text_color=_dim).pack(side="left")
 
-        ctk.CTkLabel(bar, text="│", font=_divf, text_color=_dim).pack(side="left", pady=0)
+        ctk.CTkLabel(left, text="UPSTREAM", font=_lf, text_color=_muted).pack(
+            side="left", padx=(8, 3)
+        )
+        self._pib_upstream = ctk.CTkLabel(left, text="—", font=_vf, text_color="#64748b")
+        self._pib_upstream.pack(side="left", padx=(0, 10))
 
-        ctk.CTkLabel(bar, text="MODO", font=_lf, text_color=_muted).pack(side="left", padx=(10, 3), pady=0)
-        self._pib_mode = ctk.CTkLabel(bar, text="—", font=_sf, text_color="#64748b")
-        self._pib_mode.pack(side="left", padx=(0, 10), pady=0)
+        ctk.CTkLabel(left, text="│", font=_divf, text_color=_dim).pack(side="left")
 
-        ctk.CTkLabel(bar, text="│", font=_divf, text_color=_dim).pack(side="left", pady=0)
+        ctk.CTkLabel(left, text="MODO", font=_lf, text_color=_muted).pack(
+            side="left", padx=(10, 3)
+        )
+        self._pib_mode = ctk.CTkLabel(left, text="—", font=_sf, text_color="#64748b")
+        self._pib_mode.pack(side="left", padx=(0, 10))
 
-        self._pib_backend = ctk.CTkLabel(bar, text="—", font=_sf, text_color="#64748b")
-        self._pib_backend.pack(side="left", padx=(10, 10), pady=0)
+        ctk.CTkLabel(left, text="│", font=_divf, text_color=_dim).pack(side="left")
 
-        ctk.CTkLabel(bar, text="│", font=_divf, text_color=_dim).pack(side="left", pady=0)
+        self._pib_backend = ctk.CTkLabel(left, text="—", font=_sf, text_color="#64748b")
+        self._pib_backend.pack(side="left", padx=(10, 10))
 
-        self._pib_apps = ctk.CTkLabel(bar, text="—", font=_sf, text_color="#64748b")
-        self._pib_apps.pack(side="left", padx=(10, 12), pady=0)
+        ctk.CTkLabel(left, text="│", font=_divf, text_color=_dim).pack(side="left")
+
+        self._pib_apps = ctk.CTkLabel(left, text="—", font=_sf, text_color="#64748b")
+        self._pib_apps.pack(side="left", padx=(10, 8))
+
+        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right.pack(side="right", padx=(4, 12), pady=6)
+        ctk.CTkLabel(right, text="│", font=_divf, text_color=_dim).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(right, text="SOCKS5", font=_lf, text_color=_muted).pack(side="left")
+        self._pib_socks = ctk.CTkLabel(right, text="off", font=_vf, text_color="#64748b")
+        self._pib_socks.pack(side="left", padx=(4, 0))
+        Tooltip(
+            right,
+            f"Túnel SSH SOCKS5 em 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+            "Independente do proxy local (gost).",
+        )
 
     def _update_proxy_info_bar(self) -> None:
         if not hasattr(self, "_pib_dot"):
@@ -815,6 +863,7 @@ class ProxyManagerApp(ctk.CTk):
             self._pib_mode.configure(text="—", text_color="#475569")
             self._pib_backend.configure(text="—", text_color="#475569")
             self._pib_apps.configure(text="—", text_color="#475569")
+            self._update_pib_socks()
             return
 
         # Dot
@@ -870,6 +919,63 @@ class ProxyManagerApp(ctk.CTk):
             text=f"{n} app{'s' if n != 1 else ''} com proxy",
             text_color=color,
         )
+        self._update_pib_socks()
+
+    def _update_pib_socks(self) -> None:
+        if not hasattr(self, "_pib_socks"):
+            return
+        if ssh_socks.is_running():
+            self._pib_socks.configure(
+                text=f"on :{ssh_socks.DEFAULT_LOCAL_PORT}",
+                text_color="#4ade80",
+            )
+        else:
+            self._pib_socks.configure(text="off", text_color="#64748b")
+
+    def _build_ssh_socks_tile(self, parent: ctk.CTkFrame) -> None:
+        tile = ctk.CTkFrame(
+            parent,
+            width=52,
+            height=44,
+            corner_radius=10,
+            fg_color="#334155",
+            border_width=2,
+            border_color="#475569",
+            cursor="hand2",
+        )
+        tile.pack(side="left", padx=(8, 0))
+        tile.pack_propagate(False)
+
+        icon_lbl = ctk.CTkLabel(
+            tile,
+            text="S5",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#cbd5e1",
+        )
+        icon_lbl.place(relx=0.5, rely=0.32, anchor="center")
+        state_lbl = ctk.CTkLabel(
+            tile,
+            text="off",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#94a3b8",
+        )
+        state_lbl.place(relx=0.5, rely=0.72, anchor="center")
+
+        self._ssh_socks_btn = tile
+        self._ssh_socks_icon = icon_lbl
+        self._ssh_socks_state = state_lbl
+        self._ssh_socks_tooltip = Tooltip(
+            tile,
+            "Túnel SOCKS5 via SSH (scm_vps_dici)\n"
+            f"Local: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+            "Independente do proxy gost. Clique para ligar/desligar.",
+        )
+
+        def _click(_e=None) -> None:
+            self._toggle_ssh_socks_tunnel()
+
+        for w in (tile, icon_lbl, state_lbl):
+            w.bind("<Button-1>", _click)
 
     def _build_mode_header_buttons(self, parent: ctk.CTkFrame) -> None:
         modes = [
@@ -910,6 +1016,53 @@ class ProxyManagerApp(ctk.CTk):
                 bind_click(w)
 
             self._mode_tiles[mode] = tile
+
+    def _sync_ssh_socks_button(self) -> None:
+        if not hasattr(self, "_ssh_socks_btn"):
+            return
+        enabled, msg = ssh_socks.status()
+        if enabled:
+            self._ssh_socks_btn.configure(border_color="#4ade80", fg_color="#1e3a2f")
+            self._ssh_socks_icon.configure(text_color="#4ade80")
+            self._ssh_socks_state.configure(text="on", text_color="#4ade80")
+        else:
+            self._ssh_socks_btn.configure(border_color="#475569", fg_color="#334155")
+            self._ssh_socks_icon.configure(text_color="#cbd5e1")
+            self._ssh_socks_state.configure(text="off", text_color="#94a3b8")
+        if hasattr(self, "_ssh_socks_tooltip"):
+            self._ssh_socks_tooltip.set_text(
+                f"{msg}\n"
+                f"Local: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+                "Independente do proxy gost. Clique para ligar/desligar."
+            )
+        self._update_pib_socks()
+
+    def _toggle_ssh_socks_tunnel(self) -> None:
+        self._ssh_socks_state.configure(text="…", text_color="#fbbf24")
+        self.status_label.configure(text="Túnel SOCKS5: alternando…", text_color="#fbbf24")
+
+        def worker() -> None:
+            try:
+                enabled, msg = ssh_socks.toggle_tunnel()
+            except Exception as exc:
+                enabled, msg = False, str(exc)
+
+            def _finish() -> None:
+                self._sync_ssh_socks_button()
+                self._update_proxy_info_bar()
+                color = "#4ade80" if enabled else (
+                    "#f87171"
+                    if any(x in msg.lower() for x in ("erro", "falha", "não encontr", "timeout"))
+                    else "#94a3b8"
+                )
+                prefix = "SOCKS5 habilitado" if enabled else "SOCKS5 desabilitado"
+                self.status_label.configure(text=f"{prefix} — {msg}"[:120], text_color=color)
+                level = "success" if enabled else ("error" if color == "#f87171" else "info")
+                self._toast(msg[:160], level)
+
+            self.after(0, _finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _active_auto_mode_key(self) -> str:
         p = self.store.proxy
@@ -1784,6 +1937,7 @@ class ProxyManagerApp(ctk.CTk):
             (svc_mod.SVC_SCANNER,    1, 0),
             (svc_mod.SVC_IFACE,      1, 1),
             (svc_mod.SVC_TRAY,       1, 2),
+            (svc_mod.SVC_SSH_SOCKS,  1, 3),
         ]
 
         for svc_id, row, col in services_layout:
@@ -2594,11 +2748,18 @@ class ProxyManagerApp(ctk.CTk):
         route = p.upstream_scheme_display if p.upstream_host else "configure proxy externo"
         source = SOURCE_LABELS.get(p.source, p.source)
         with_proxy = sum(1 for proc in processes if proc.proxy_active)
+        socks_on = ssh_socks.is_running()
+        socks_part = (
+            f"  |  SOCKS5 on (:{ssh_socks.DEFAULT_LOCAL_PORT})"
+            if socks_on
+            else "  |  SOCKS5 off"
+        )
         if not preserve_status and not self._auto_config_running:
             self.status_label.configure(
                 text=(
                     f"[{source}] Local {local} ({LOCAL_PORT}) → {route}"
                     f"  |  {with_proxy} apps com proxy"
+                    f"{socks_part}"
                 )
             )
         self._update_ip_display()
@@ -2606,6 +2767,7 @@ class ProxyManagerApp(ctk.CTk):
             self.global_proxy_var.set(is_running())
             self._sync_global_switch_label()
         self._sync_auto_mode_header()
+        self._sync_ssh_socks_button()
         if is_running() and self._proxy_verified:
             self._maybe_fetch_public_ip(processes, force=False)
 
@@ -3662,6 +3824,7 @@ class ProxyManagerApp(ctk.CTk):
             # Apps encerrados acima serão reabertos pelo usuário sem HTTP_PROXY.
             stop_local_proxy()
             svc_mod.update(svc_mod.SVC_GOST, "parado", "Reset de emergência.")
+            ssh_socks.stop_tunnel()
 
             self.store.proxy.enabled = False
             self.store.save()
@@ -3677,6 +3840,7 @@ class ProxyManagerApp(ctk.CTk):
                 self.global_proxy_var.set(False)
                 self._sync_global_switch_label()
                 self._sync_auto_mode_header()
+                self._sync_ssh_socks_button()
                 self._update_ip_display()
                 self._apps_list_layout_key = None
                 self._schedule_refresh_apps_list()
