@@ -19,6 +19,10 @@ version_file = ROOT / "proxy_manager" / "_version.txt"
 if version_file.exists():
     datas += [(str(version_file), "proxy_manager")]
 
+commit_file = ROOT / "proxy_manager" / "_commit.txt"
+if commit_file.exists():
+    datas += [(str(commit_file), "proxy_manager")]
+
 hidden = [
     *collect_submodules("proxy_manager"),
     "PIL._tkinter_finder",

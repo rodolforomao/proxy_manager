@@ -11,6 +11,7 @@ from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.models import AppRule, ProxySettings
 from proxy_manager.network import AUTO_INTERFACE
 from proxy_manager.proxy_env import build_proxy_env
+from proxy_manager import ssh_socks_tunnel as ssh_socks
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 LAUNCH_SCRIPT = SCRIPTS_DIR / "launch_on_iface.sh"
@@ -34,6 +35,13 @@ def _systemd_bind_supported() -> bool:
 _SYSTEMD_BIND = _systemd_bind_supported()
 
 
+def resolve_app_upstream(app: AppRule | None) -> str:
+    """Upstream efetivo do app: túnel SOCKS5 (SSH) se marcado, senão upstream_proxy manual."""
+    if app is not None and getattr(app, "use_socks5", False):
+        return ssh_socks.upstream_url()
+    return getattr(app, "upstream_proxy", "") if app else ""
+
+
 def launch_command(
     cmd: list[str],
     *,
@@ -55,8 +63,12 @@ def launch_command(
             cmd = resolved
         cmd = wrap_browser_command(app, cmd, use_proxy=use_proxy)
 
-    app_upstream = getattr(app, "upstream_proxy", "") if app else ""
-    env = build_proxy_env(proxy, use_proxy, base_env, app_upstream=app_upstream)
+    # App marcado com use_socks5 sai pelo túnel SSH SOCKS5 (RustDesk etc.),
+    # ignorando o upstream_proxy manual e o proxy padrão (gost/Tor/free/paid) —
+    # e independe do interruptor use_proxy (que é sobre o gost).
+    via_socks5 = bool(app and getattr(app, "use_socks5", False))
+    app_upstream = resolve_app_upstream(app)
+    env = build_proxy_env(proxy, use_proxy or via_socks5, base_env, app_upstream=app_upstream)
 
     if network_interface == AUTO_INTERFACE:
         return subprocess.Popen(
@@ -106,4 +118,5 @@ def launch_app_rule(app, proxy: ProxySettings) -> subprocess.Popen[bytes] | None
         proxy=proxy,
         use_proxy=app.use_proxy,
         network_interface=app.network_interface,
+        app=app,
     )

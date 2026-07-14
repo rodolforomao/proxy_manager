@@ -5,8 +5,6 @@ import subprocess
 import urllib.request
 from dataclasses import dataclass, field
 
-from proxy_manager.browser_proxy import is_browser_app, prepare_browser_proxy
-from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
 from proxy_manager.local_proxy import (
     LOCAL_PORT,
     force_stop_local_proxy,
@@ -15,6 +13,7 @@ from proxy_manager.local_proxy import (
 )
 from proxy_manager.models import AppRule, LOCAL_HOST, ProxySettings
 from proxy_manager.proxy_env import read_process_proxy_env
+from proxy_manager.app_proxy_sync import clear_persistent_app_proxies
 
 _LOCAL_PROXY_NEEDLE = f"http://{LOCAL_HOST}:{LOCAL_PORT}"
 
@@ -40,7 +39,7 @@ class RestoreReport:
 
 
 def _reset_gnome_system_proxy() -> tuple[bool, str]:
-  try:
+    try:
         result = subprocess.run(
             ["gsettings", "get", "org.gnome.system.proxy", "mode"],
             capture_output=True,
@@ -151,19 +150,9 @@ def restore_direct_traffic(
     else:
         report.steps.append(f"Porta {LOCAL_PORT} livre")
 
-    cleared = 0
-    for app in apps:
-        try:
-            if is_claude_app(app):
-                prepare_claude_proxy(proxy, use_proxy=False)
-                cleared += 1
-            elif is_browser_app(app):
-                prepare_browser_proxy(app, proxy, use_proxy=False)
-                cleared += 1
-        except Exception as exc:
-            report.warnings.append(f"{app.name}: {exc}")
-    if cleared:
-        report.steps.append(f"Proxy removido de {cleared} app(s) (Claude/Firefox)")
+    changed = clear_persistent_app_proxies(apps, proxy)
+    if changed:
+        report.steps.append(f"Proxy removido de {len(changed)} app(s) (Claude/Firefox)")
 
     gnome_ok, gnome_msg = _reset_gnome_system_proxy()
     report.steps.append(gnome_msg if gnome_ok else f"Falha — {gnome_msg}")

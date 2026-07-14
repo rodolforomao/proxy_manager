@@ -74,6 +74,20 @@ def default_apps() -> list[AppRule]:
             command="telegram-desktop",
         ),
         AppRule(
+            id="rustdesk",
+            name="RustDesk",
+            patterns=["rustdesk"],
+            use_proxy=False,
+            use_socks5=True,
+            category="tools",
+            command="rustdesk",
+            notes=(
+                "NÃO usa o proxy gost (:7890). Toggle S5 do card (ou o botão S5 "
+                "do header) liga o túnel SSH SOCKS5 em 127.0.0.1:1080 — configure "
+                "no RustDesk: Settings → Network → Socks5."
+            ),
+        ),
+        AppRule(
             id="spotify",
             name="Spotify",
             patterns=["spotify"],

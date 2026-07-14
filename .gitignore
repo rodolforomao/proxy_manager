@@ -60,3 +60,4 @@ Thumbs.db
 
 # Versão gerada pelo build.sh
 proxy_manager/_version.txt
+proxy_manager/_commit.txt

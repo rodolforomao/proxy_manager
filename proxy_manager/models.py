@@ -69,6 +69,7 @@ class AppRule:
     notes: str = ""
     network_interface: str = AUTO_INTERFACE
     upstream_proxy: str = ""
+    use_socks5: bool = False
 
     def matches_process(self, name: str, cmdline: str) -> bool:
         haystack = f"{name} {cmdline}".lower()

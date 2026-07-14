@@ -1,7 +1,13 @@
 """Túnel SOCKS5 via SSH (-D) — equivalente a tunnel-socks5-ssh.sh do scm_vps_dici.
 
 Abre um proxy SOCKS5 local (padrão 127.0.0.1:1080) através de SSH até o VPS.
-Independente do proxy local (gost :7890). Credenciais vêm do .env do projeto SCM.
+
+IMPORTANTE — isolamento total do Tor / gost:
+- Este túnel é só para apps que apontam manualmente (ex.: RustDesk → Socks5).
+- NÃO é upstream do proxy local (:7890) e NÃO substitui Tor (:9050/:9051).
+- Ligar/desligar aqui não deve alterar source, verificação nem modo Tor/Rápido.
+
+Credenciais vêm do .env do projeto SCM.
 """
 
 from __future__ import annotations
@@ -95,36 +101,50 @@ def load_ssh_config(
     )
 
 
+def upstream_url(local_port: int = DEFAULT_LOCAL_PORT) -> str:
+    """URL a usar como HTTP(S)_PROXY/ALL_PROXY de um app que deva sair por este túnel."""
+    return f"socks5h://127.0.0.1:{local_port}"
+
+
 def is_running(local_port: int = DEFAULT_LOCAL_PORT) -> bool:
+    """True só se o nosso processo SSH (PID file) ainda escuta a porta.
+
+    Porta ocupada por outro processo NÃO conta como túnel nosso — evita
+    confundir serviços alheios com o botão S5 e interferir no Tor/gost.
+    """
     pid = _read_pid()
     if not pid:
-        return is_port_open("127.0.0.1", local_port)
+        return False
     if not Path(f"/proc/{pid}").exists():
         _clear_pid()
         return False
     return is_port_open("127.0.0.1", local_port)
 
 
-def status(local_port: int = DEFAULT_LOCAL_PORT) -> tuple[bool, str]:
-    """Retorna (habilitado, mensagem). Atualiza o card de Serviços."""
+def status(local_port: int = DEFAULT_LOCAL_PORT, *, update_svc: bool = True) -> tuple[bool, str]:
+    """Retorna (habilitado, mensagem). Opcionalmente atualiza o card de Serviços."""
     pid = _read_pid()
     listening = is_port_open("127.0.0.1", local_port)
+    foreign = listening and not (pid and Path(f"/proc/{pid}").exists())
 
     if pid and Path(f"/proc/{pid}").exists() and listening:
         msg = f"Habilitado — socks5://127.0.0.1:{local_port} (PID {pid})"
-        svc.update(SVC_ID, "ok", msg)
+        if update_svc:
+            svc.update(SVC_ID, "ok", msg)
         return True, msg
 
-    if listening and not pid:
-        msg = f"Porta {local_port} em uso (outro processo)"
-        svc.update(SVC_ID, "aviso", msg)
-        return True, msg
+    if foreign:
+        msg = f"Porta {local_port} em uso (outro processo) — túnel S5 off"
+        if update_svc:
+            svc.update(SVC_ID, "aviso", msg)
+        return False, msg
 
     if pid and not Path(f"/proc/{pid}").exists():
         _clear_pid()
 
     msg = "Desabilitado"
-    svc.update(SVC_ID, "parado", msg)
+    if update_svc:
+        svc.update(SVC_ID, "parado", msg)
     return False, msg
 
 
@@ -165,6 +185,14 @@ def start_tunnel(
     if is_running(local_port):
         return status(local_port)
 
+    if is_port_open("127.0.0.1", local_port):
+        msg = (
+            f"Porta {local_port} já está em uso por outro processo. "
+            "Feche-o ou escolha outra porta — não vamos matar processos alheios."
+        )
+        svc.update(SVC_ID, "erro", msg)
+        return False, msg
+
     try:
         cfg = load_ssh_config(env_file=env_file, local_port=local_port)
     except (FileNotFoundError, ValueError, OSError) as exc:
@@ -187,12 +215,28 @@ def start_tunnel(
             f"→ {cfg.user}@{cfg.host}:{cfg.port} -D {cfg.local_port} ---\n"
         )
         log_handle.flush()
+        # Ambiente limpo de proxies — não herdar HTTP(S)_PROXY/ALL_PROXY do app
+        # (evita o SSH do túnel S5 passar pelo gost/Tor por acidente).
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.lower()
+            not in (
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+                "ftp_proxy",
+                "socks_proxy",
+            )
+        }
+        clean_env["SSH_ASKPASS_REQUIRE"] = "never"
         proc = subprocess.Popen(
             cmd,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env={**os.environ, "SSH_ASKPASS_REQUIRE": "never"},
+            env=clean_env,
         )
     except OSError as exc:
         log_handle.close()
@@ -233,7 +277,7 @@ def start_tunnel(
 
 
 def stop_tunnel(local_port: int = DEFAULT_LOCAL_PORT) -> tuple[bool, str]:
-    """Encerra o túnel SOCKS5. Retorna (ok, mensagem)."""
+    """Encerra só o nosso túnel SOCKS5 (PID file). Não mata outros processos na porta."""
     pid = _read_pid()
     if pid:
         try:
@@ -244,18 +288,6 @@ def stop_tunnel(local_port: int = DEFAULT_LOCAL_PORT) -> tuple[bool, str]:
         except OSError:
             pass
         _clear_pid()
-
-    # Limpa listener órfão na porta padrão do túnel
-    if is_port_open("127.0.0.1", local_port):
-        try:
-            subprocess.run(
-                ["fuser", "-k", f"{local_port}/tcp"],
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
 
     msg = "Desabilitado"
     svc.update(SVC_ID, "parado", msg)

@@ -11,7 +11,7 @@ from proxy_manager.profiles import ProxyProfile
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CONFIG_VERSION = 13
+CONFIG_VERSION = 15
 RECENT_APPS_MAX = 20
 
 
@@ -31,6 +31,7 @@ def _app_to_dict(app: AppRule) -> dict:
         "notes": app.notes,
         "network_interface": app.network_interface,
         "upstream_proxy": app.upstream_proxy,
+        "use_socks5": app.use_socks5,
     }
 
 
@@ -46,6 +47,7 @@ def _app_from_dict(data: dict) -> AppRule:
         notes=data.get("notes", ""),
         network_interface=data.get("network_interface", AUTO_INTERFACE),
         upstream_proxy=data.get("upstream_proxy", ""),
+        use_socks5=data.get("use_socks5", False),
     )
 
 
@@ -150,6 +152,33 @@ class ConfigStore:
                     app.patterns = ["google-chrome", "chromium", "chromium-browser"]
                     app.notes = (
                         "Chrome ou Chromium — reinicia com --proxy-server apontando para o proxy local."
+                    )
+        if from_version < 14:
+            if not any(a.id == "rustdesk" for a in self.apps):
+                self.apps.append(
+                    AppRule(
+                        id="rustdesk",
+                        name="RustDesk",
+                        patterns=["rustdesk"],
+                        use_proxy=False,
+                        use_socks5=True,
+                        category="tools",
+                        command="rustdesk",
+                        notes=(
+                            "NÃO usa o proxy gost (:7890). Toggle S5 do card (ou o botão S5 "
+                            "do header) liga o túnel SSH SOCKS5 em 127.0.0.1:1080 — configure "
+                            "no RustDesk: Settings → Network → Socks5."
+                        ),
+                    )
+                )
+        if from_version < 15:
+            for app in self.apps:
+                if app.id == "rustdesk":
+                    app.use_socks5 = True
+                    app.notes = (
+                        "NÃO usa o proxy gost (:7890). Toggle S5 do card (ou o botão S5 "
+                        "do header) liga o túnel SSH SOCKS5 em 127.0.0.1:1080 — configure "
+                        "no RustDesk: Settings → Network → Socks5."
                     )
 
     def touch_recent_app(self, app_id: str) -> None:

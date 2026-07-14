@@ -130,6 +130,31 @@ def test_auto_interface_constant():
     assert AUTO_INTERFACE == "auto"
 
 
+# ── version ──────────────────────────────────────────────────────────────────
+
+def test_window_title_appends_commit_hash(tmp_path, monkeypatch):
+    from proxy_manager import version as version_mod
+
+    commit_file = tmp_path / "_commit.txt"
+    commit_file.write_text("abcdef1234567\n", encoding="utf-8")
+    monkeypatch.setattr(version_mod, "_commit_file_candidates", lambda: [commit_file])
+    version_mod.app_commit_hash.cache_clear()
+
+    assert version_mod.app_commit_hash() == "234567"
+    title = version_mod.window_title()
+    assert title.startswith(f"Proxy Manager {version_mod.app_version()} (234567)")
+    version_mod.app_commit_hash.cache_clear()
+
+
+def test_window_title_without_commit_hash(monkeypatch):
+    from proxy_manager import version as version_mod
+
+    monkeypatch.setattr(version_mod, "_commit_file_candidates", lambda: [])
+    monkeypatch.setattr(version_mod, "app_commit_hash", lambda: "")
+
+    assert "(" not in version_mod.window_title()
+
+
 # ── ConfigStore ──────────────────────────────────────────────────────────────
 
 def test_configstore_init_fresh(tmp_path):
@@ -200,6 +225,108 @@ def test_claude_tcp_proxy_detection():
     host_hex, port_hex = _local_proxy_tcp_hex()
     assert host_hex == "0100007F"
     assert port_hex == "1ED2"  # LOCAL_PORT 7890
+
+
+def test_sync_persistent_clears_claude_when_proxy_off(tmp_path, monkeypatch):
+    from proxy_manager import app_proxy_sync, claude_proxy
+    from proxy_manager.models import AppRule, ProxySettings
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"env":{"HTTP_PROXY":"http://127.0.0.1:7890","HTTPS_PROXY":"http://127.0.0.1:7890"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_proxy, "CLAUDE_SETTINGS", settings)
+
+    apps = [
+        AppRule(id="claude", name="Claude Code", patterns=["claude"], use_proxy=True),
+        AppRule(id="cursor", name="Cursor", patterns=["cursor"], use_proxy=False),
+    ]
+    proxy = ProxySettings(enabled=False)
+
+    changed = app_proxy_sync.sync_persistent_app_proxies(
+        apps, proxy, local_proxy_active=False
+    )
+    assert "claude" in changed
+    assert claude_proxy.claude_settings_proxy_active() is False
+    data = settings.read_text(encoding="utf-8")
+    assert "7890" not in data
+
+
+def test_sync_persistent_applies_claude_when_proxy_on(tmp_path, monkeypatch):
+    from proxy_manager import app_proxy_sync, claude_proxy
+    from proxy_manager.models import AppRule, ProxySettings
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(claude_proxy, "CLAUDE_SETTINGS", settings)
+
+    apps = [
+        AppRule(id="claude", name="Claude Code", patterns=["claude"], use_proxy=True),
+    ]
+    proxy = ProxySettings(enabled=True, source="tor", upstream_host="127.0.0.1", upstream_port=9050)
+
+    changed = app_proxy_sync.sync_persistent_app_proxies(
+        apps, proxy, local_proxy_active=True
+    )
+    assert "claude" in changed
+    assert claude_proxy.claude_settings_proxy_active() is True
+    assert "7890" in settings.read_text(encoding="utf-8")
+
+
+def test_app_rule_use_socks5_default_false():
+    app = AppRule(id="rustdesk", name="RustDesk", patterns=["rustdesk"])
+    assert app.use_socks5 is False
+
+
+def test_configstore_roundtrips_use_socks5(tmp_path):
+    from proxy_manager.config import ConfigStore
+
+    store = ConfigStore(path=tmp_path / "config.json")
+    app = AppRule(id="rustdesk", name="RustDesk", patterns=["rustdesk"], use_socks5=True)
+    store.update_app(app)
+
+    store2 = ConfigStore(path=tmp_path / "config.json")
+    assert store2.get_app("rustdesk").use_socks5 is True
+
+
+def test_resolve_app_upstream_prefers_socks5_tunnel():
+    from proxy_manager.launcher import resolve_app_upstream
+    from proxy_manager import ssh_socks_tunnel as ssh_socks
+
+    app = AppRule(
+        id="rustdesk",
+        name="RustDesk",
+        patterns=["rustdesk"],
+        use_socks5=True,
+        upstream_proxy="http://ignored:1234",
+    )
+    assert resolve_app_upstream(app) == ssh_socks.upstream_url()
+
+
+def test_resolve_app_upstream_falls_back_to_manual_upstream():
+    from proxy_manager.launcher import resolve_app_upstream
+
+    app = AppRule(
+        id="cursor",
+        name="Cursor",
+        patterns=["cursor"],
+        use_socks5=False,
+        upstream_proxy="http://manual:8080",
+    )
+    assert resolve_app_upstream(app) == "http://manual:8080"
+
+
+def test_build_proxy_env_socks5_upstream_overrides_use_proxy_off():
+    """use_socks5 deve rotear o app mesmo com o interruptor use_proxy (gost) desligado."""
+    from proxy_manager.launcher import resolve_app_upstream
+    from proxy_manager import ssh_socks_tunnel as ssh_socks
+
+    app = AppRule(id="rustdesk", name="RustDesk", patterns=["rustdesk"], use_proxy=False, use_socks5=True)
+    p = ProxySettings(enabled=False, source="direct")
+    via_socks5 = bool(app and getattr(app, "use_socks5", False))
+    env = build_proxy_env(p, app.use_proxy or via_socks5, base_env={}, app_upstream=resolve_app_upstream(app))
+    assert env.get("HTTP_PROXY") == ssh_socks.upstream_url()
 
 
 def test_scan_matches_disabled_app_rules():

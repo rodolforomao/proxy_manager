@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shutil
+import signal
 import threading
 import time
 import uuid
@@ -14,6 +16,10 @@ from tkinter import messagebox, ttk
 
 from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, scan_installed_apps
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
+from proxy_manager.app_proxy_sync import (
+    clear_persistent_app_proxies,
+    sync_persistent_app_proxies,
+)
 from proxy_manager.version import window_title
 from proxy_manager.brand_icon import apply_window_icon
 from proxy_manager.browser_proxy import (
@@ -44,6 +50,7 @@ from proxy_manager.local_proxy import (
     GOST_BIN,
     GOST_VERSION,
     ensure_local_proxy,
+    force_stop_local_proxy,
     get_backend_name,
     get_running_pid,
     is_running,
@@ -135,8 +142,13 @@ CATEGORY_LABELS = {
     "tools": "Ferramentas",
     "custom": "Personalizado",
 }
-SECTION_PROXY_ON = "● Proxy ligado"
+SECTION_PROXY_ON = "● Proxy / SOCKS5 ligado"
 SECTION_RECENT = "◷ Recentes"
+
+# Cores fixas: tudo relacionado a Tor é laranja, tudo relacionado a SOCKS5 é azul —
+# consistente em qualquer lugar da UI que indique um dos dois.
+TOR_COLOR = "#f97316"
+SOCKS5_COLOR = "#60a5fa"
 
 
 class ProxyManagerApp(ctk.CTk):
@@ -167,6 +179,7 @@ class ProxyManagerApp(ctk.CTk):
         self._PROXY_IP_TTL = 90.0
         self._auto_config_running = False
         self._proxy_verified = False
+        self._shutdown_done = False
         self._pending_reapply_app_ids: list[str] = []
         self._quick_app_tiles: dict[str, dict] = {}
         self._mode_tiles: dict[str, ctk.CTkFrame] = {}
@@ -298,9 +311,21 @@ class ProxyManagerApp(ctk.CTk):
         self._restore_banner = None
 
     def _cleanup_stale_proxy_on_startup(self) -> None:
-        """Encerra proxy órfão na 7890 quando o usuário desligou o interruptor."""
-        if self.store.proxy.enabled:
-            if is_running() and not upstream_matches(self.store.proxy):
+        """Alinha proxy local + configs persistentes com o estado real no boot."""
+        running = is_running()
+
+        # Proxy morto/desligado: limpa Claude/browsers para não apontarem à 7890 fantasma.
+        if not (self.store.proxy.enabled and running):
+            if self.store.proxy.enabled and not running:
+                self.store.proxy.enabled = False
+                self.store.save()
+            self._resync_persistent_app_proxies(local_proxy_active=False)
+            if hasattr(self, "global_proxy_var"):
+                self.global_proxy_var.set(False)
+                self._sync_global_switch_label()
+
+        if self.store.proxy.enabled and running:
+            if not upstream_matches(self.store.proxy):
                 svc_mod.update(
                     svc_mod.SVC_GOST,
                     "aviso",
@@ -310,9 +335,14 @@ class ProxyManagerApp(ctk.CTk):
                     target=lambda: restart_local_proxy(self.store.proxy),
                     daemon=True,
                 ).start()
+            else:
+                # Proxy vivo: regrava configs dos apps conforme use_proxy.
+                self._resync_persistent_app_proxies(local_proxy_active=True)
             return
-        if not is_running():
+
+        if not running:
             return
+
         svc_mod.update(
             svc_mod.SVC_GOST,
             "aviso",
@@ -322,6 +352,7 @@ class ProxyManagerApp(ctk.CTk):
 
         def worker() -> None:
             ok, msg = stop_local_proxy()
+            clear_persistent_app_proxies(self.store.apps, self.store.proxy)
             svc_mod.update(
                 svc_mod.SVC_GOST,
                 "ok" if ok else "erro",
@@ -504,21 +535,38 @@ class ProxyManagerApp(ctk.CTk):
         self._update_header_from_processes(self._scanner.cache)
 
     def _clear_browser_proxies_for_apps(self) -> None:
+        """Limpa configs persistentes (Claude settings.json, Firefox, etc.)."""
+        clear_persistent_app_proxies(self.store.apps, self.store.proxy)
         for app in self.store.apps:
-            if is_claude_app(app):
-                try:
-                    prepare_claude_proxy(self.store.proxy, use_proxy=False)
+            if is_claude_app(app) and app.use_proxy:
+                app.use_proxy = False
+                self.store.update_app(app)
+
+    def _resync_persistent_app_proxies(
+        self,
+        *,
+        local_proxy_active: bool | None = None,
+        clear_claude_preference: bool = False,
+    ) -> None:
+        """Relê apps/config e reaplica (ou limpa) Claude/browsers conforme o proxy local."""
+        active = (
+            local_proxy_active
+            if local_proxy_active is not None
+            else bool(is_running() and self._proxy_verified and self.store.proxy.enabled)
+        )
+        sync_persistent_app_proxies(
+            self.store.apps,
+            self.store.proxy,
+            local_proxy_active=active,
+        )
+        if not active and clear_claude_preference:
+            for app in self.store.apps:
+                if is_claude_app(app) and app.use_proxy:
                     app.use_proxy = False
-                    self.store.update_app(app)
-                except Exception:
-                    pass
-                continue
-            if not is_browser_app(app):
-                continue
-            try:
-                prepare_browser_proxy(app, self.store.proxy, use_proxy=False)
-            except Exception:
-                pass
+                    try:
+                        self.store.update_app(app)
+                    except Exception:
+                        pass
 
     def _fix_broken_fast_upstream(self) -> None:
         p = self.store.proxy
@@ -615,11 +663,7 @@ class ProxyManagerApp(ctk.CTk):
         top.grid(row=0, column=0, sticky="ew")
         top.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            top,
-            text="Proxy Manager",
-            font=ctk.CTkFont(size=22, weight="bold"),
-        ).grid(row=0, column=0, sticky="w")
+        self._build_network_status_strip(top)
 
         self.ip_frame = ctk.CTkFrame(top, fg_color="transparent")
         self.ip_frame.grid(row=0, column=1, sticky="e", padx=(8, 0))
@@ -706,7 +750,7 @@ class ProxyManagerApp(ctk.CTk):
         self._sync_auto_mode_header()
 
         self._build_ssh_socks_tile(row1)
-        self.after(300, self._sync_ssh_socks_button)
+        self.after(300, lambda: self._sync_ssh_socks_button(update_svc=True))
 
         self._iface_bar = ctk.CTkFrame(row1, fg_color="transparent")
         self._iface_bar.pack(side="left", padx=(8, 0))
@@ -771,6 +815,7 @@ class ProxyManagerApp(ctk.CTk):
 
         self._n_apps_proxy = 0
         self._build_proxy_info_bar(header)
+        self.after(300, self._update_network_status_strip)
 
         self._build_quick_apps_bar()
 
@@ -785,6 +830,88 @@ class ProxyManagerApp(ctk.CTk):
         self._build_processes_tab()
         self._build_settings_tab()
         self._build_services_tab()
+
+    # ── Faixa de status de rede (substitui o título "Proxy Manager") ─────────
+
+    def _build_network_status_strip(self, parent: ctk.CTkFrame) -> None:
+        strip = ctk.CTkFrame(parent, fg_color="transparent")
+        strip.grid(row=0, column=0, sticky="w")
+        self._net_status_badges: dict[str, dict] = {}
+
+        def _mk_badge(key: str, icon: str, tip: str) -> None:
+            badge = ctk.CTkFrame(
+                strip,
+                corner_radius=8,
+                fg_color="#1e293b",
+                border_width=1,
+                border_color="#334155",
+            )
+            badge.pack(side="left", padx=(0, 6))
+            row = ctk.CTkFrame(badge, fg_color="transparent")
+            row.pack(padx=8, pady=5)
+            ctk.CTkLabel(row, text=icon, font=ctk.CTkFont(size=13, weight="bold"), text_color="#94a3b8").pack(
+                side="left", padx=(0, 4)
+            )
+            val_lbl = ctk.CTkLabel(row, text="—", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748b")
+            val_lbl.pack(side="left")
+            tooltip = Tooltip(badge, tip)
+            tooltip.bind_extra(row)
+            for child in row.winfo_children():
+                tooltip.bind_extra(child)
+            self._net_status_badges[key] = {"badge": badge, "val": val_lbl, "tooltip": tooltip}
+
+        _mk_badge("tor", "🧅", "Tor — verificando…")
+        _mk_badge("wifi", "📶", "Wi-Fi — verificando…")
+        _mk_badge("eth", "🔌", "Cabo — verificando…")
+        _mk_badge("socks5", "S5", "Túnel SSH SOCKS5 — verificando…")
+
+    def _update_network_status_strip(self) -> None:
+        badges = getattr(self, "_net_status_badges", None)
+        if not badges:
+            return
+        from proxy_manager.network import list_interfaces
+
+        def _set(key: str, text: str, *, active: bool, tip: str, color: str = "#4ade80") -> None:
+            b = badges.get(key)
+            if not b:
+                return
+            b["val"].configure(text=text, text_color=color if active else "#64748b")
+            b["badge"].configure(border_color=color if active else "#334155")
+            b["tooltip"].set_text(tip)
+
+        tor_on, tor_msg = tor_status(self.store.proxy.upstream_port or DEFAULT_TOR_PORT)
+        _set(
+            "tor",
+            f"on :{self.store.proxy.upstream_port or DEFAULT_TOR_PORT}" if tor_on else "off",
+            active=tor_on,
+            tip=f"Tor\n{tor_msg}",
+            color=TOR_COLOR,
+        )
+
+        wifi_iface = next((i for i in list_interfaces() if i.kind == "wifi"), None)
+        if wifi_iface and wifi_iface.is_up and wifi_iface.ipv4:
+            _set("wifi", wifi_iface.ipv4, active=True, tip=f"Wi-Fi — {wifi_iface.name}\n{wifi_iface.display_full}")
+        elif wifi_iface:
+            _set("wifi", "desconectado", active=False, tip=f"Wi-Fi — {wifi_iface.name}\n{wifi_iface.display_full}")
+        else:
+            _set("wifi", "—", active=False, tip="Wi-Fi — nenhuma interface detectada")
+
+        eth_iface = next((i for i in list_interfaces() if i.kind == "ethernet"), None)
+        if eth_iface and eth_iface.is_up and eth_iface.ipv4:
+            _set("eth", eth_iface.ipv4, active=True, tip=f"Cabo — {eth_iface.name}\n{eth_iface.display_full}")
+        elif eth_iface:
+            _set("eth", "desconectado", active=False, tip=f"Cabo — {eth_iface.name}\n{eth_iface.display_full}")
+        else:
+            _set("eth", "—", active=False, tip="Cabo — nenhuma interface detectada")
+
+        socks_on = ssh_socks.is_running()
+        _set(
+            "socks5",
+            f"on :{ssh_socks.DEFAULT_LOCAL_PORT}" if socks_on else "off",
+            active=socks_on,
+            tip=f"Túnel SSH SOCKS5 (RustDesk) — 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\nIndependente do Tor e do proxy local.",
+            color=SOCKS5_COLOR,
+        )
 
     # ── Proxy info bar ───────────────────────────────────────────────────────
 
@@ -846,8 +973,8 @@ class ProxyManagerApp(ctk.CTk):
         self._pib_socks.pack(side="left", padx=(4, 0))
         Tooltip(
             right,
-            f"Túnel SSH SOCKS5 em 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
-            "Independente do proxy local (gost).",
+            f"Túnel SSH SOCKS5 (RustDesk) em 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+            "Independente do Tor e do proxy local (gost).",
         )
 
     def _update_proxy_info_bar(self) -> None:
@@ -879,7 +1006,7 @@ class ProxyManagerApp(ctk.CTk):
         elif p.source == "tor":
             port = p.upstream_port or 9050
             ups_text = f"socks5://127.0.0.1:{port}"
-            ups_color = "#c084fc"
+            ups_color = TOR_COLOR
         elif p.upstream_host:
             auth = f"{p.username}:***@" if p.username else ""
             ups_text = f"{p.scheme}://{auth}{p.upstream_host}:{p.upstream_port}"
@@ -927,7 +1054,7 @@ class ProxyManagerApp(ctk.CTk):
         if ssh_socks.is_running():
             self._pib_socks.configure(
                 text=f"on :{ssh_socks.DEFAULT_LOCAL_PORT}",
-                text_color="#4ade80",
+                text_color=SOCKS5_COLOR,
             )
         else:
             self._pib_socks.configure(text="off", text_color="#64748b")
@@ -966,9 +1093,9 @@ class ProxyManagerApp(ctk.CTk):
         self._ssh_socks_state = state_lbl
         self._ssh_socks_tooltip = Tooltip(
             tile,
-            "Túnel SOCKS5 via SSH (scm_vps_dici)\n"
-            f"Local: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
-            "Independente do proxy gost. Clique para ligar/desligar.",
+            "Túnel SOCKS5 via SSH — só para RustDesk\n"
+            f"Configure no RustDesk: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+            "Independente do Tor e do proxy gost (:7890).",
         )
 
         def _click(_e=None) -> None:
@@ -1017,14 +1144,16 @@ class ProxyManagerApp(ctk.CTk):
 
             self._mode_tiles[mode] = tile
 
-    def _sync_ssh_socks_button(self) -> None:
+    def _sync_ssh_socks_button(self, *, update_svc: bool = False) -> None:
         if not hasattr(self, "_ssh_socks_btn"):
             return
-        enabled, msg = ssh_socks.status()
+        # Leitura leve no refresh da UI — não spammar o registry de serviços
+        # (isso competia com a verificação do Tor e congelava "PROXY TESTANDO").
+        enabled, msg = ssh_socks.status(update_svc=update_svc)
         if enabled:
-            self._ssh_socks_btn.configure(border_color="#4ade80", fg_color="#1e3a2f")
-            self._ssh_socks_icon.configure(text_color="#4ade80")
-            self._ssh_socks_state.configure(text="on", text_color="#4ade80")
+            self._ssh_socks_btn.configure(border_color=SOCKS5_COLOR, fg_color="#1e3a5f")
+            self._ssh_socks_icon.configure(text_color=SOCKS5_COLOR)
+            self._ssh_socks_state.configure(text="on", text_color=SOCKS5_COLOR)
         else:
             self._ssh_socks_btn.configure(border_color="#475569", fg_color="#334155")
             self._ssh_socks_icon.configure(text_color="#cbd5e1")
@@ -1032,14 +1161,18 @@ class ProxyManagerApp(ctk.CTk):
         if hasattr(self, "_ssh_socks_tooltip"):
             self._ssh_socks_tooltip.set_text(
                 f"{msg}\n"
-                f"Local: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
-                "Independente do proxy gost. Clique para ligar/desligar."
+                f"RustDesk → Socks5 → 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}\n"
+                "Sem relação com Tor / gost."
             )
         self._update_pib_socks()
 
     def _toggle_ssh_socks_tunnel(self) -> None:
         self._ssh_socks_state.configure(text="…", text_color="#fbbf24")
-        self.status_label.configure(text="Túnel SOCKS5: alternando…", text_color="#fbbf24")
+        # Não tocar em _auto_config_running / _proxy_verified — S5 ≠ Tor/gost.
+        self.status_label.configure(
+            text="Túnel SOCKS5 (RustDesk): alternando…",
+            text_color="#fbbf24",
+        )
 
         def worker() -> None:
             try:
@@ -1048,14 +1181,14 @@ class ProxyManagerApp(ctk.CTk):
                 enabled, msg = False, str(exc)
 
             def _finish() -> None:
-                self._sync_ssh_socks_button()
-                self._update_proxy_info_bar()
-                color = "#4ade80" if enabled else (
+                self._sync_ssh_socks_button(update_svc=True)
+                self._update_pib_socks()
+                color = SOCKS5_COLOR if enabled else (
                     "#f87171"
-                    if any(x in msg.lower() for x in ("erro", "falha", "não encontr", "timeout"))
+                    if any(x in msg.lower() for x in ("erro", "falha", "não encontr", "timeout", "em uso"))
                     else "#94a3b8"
                 )
-                prefix = "SOCKS5 habilitado" if enabled else "SOCKS5 desabilitado"
+                prefix = "SOCKS5 RustDesk on" if enabled else "SOCKS5 RustDesk off"
                 self.status_label.configure(text=f"{prefix} — {msg}"[:120], text_color=color)
                 level = "success" if enabled else ("error" if color == "#f87171" else "info")
                 self._toast(msg[:160], level)
@@ -1092,7 +1225,8 @@ class ProxyManagerApp(ctk.CTk):
                 # Modo direto ativo: cinza-azul para indicar "sem proxy"
                 tile.configure(border_color="#64748b", fg_color="#1e293b")
             elif mode == active and verified:
-                tile.configure(border_color="#4ade80", fg_color="#1e3a2f")
+                color = TOR_COLOR if mode == "tor" else "#4ade80"
+                tile.configure(border_color=color, fg_color="#1e3a2f")
             elif mode == active and testing:
                 tile.configure(border_color="#fbbf24", fg_color="#3a3420")
             else:
@@ -1526,10 +1660,13 @@ class ProxyManagerApp(ctk.CTk):
             self._update_ip_display()
             self._sync_global_switch_label()
             self._update_proxy_info_bar()
+            self._update_network_status_strip()
             self._reapply_proxy_for_enabled_apps(
                 self._pending_reapply_app_ids or None
             )
             self._ensure_claude_settings_if_enabled()
+            # Após proxy validado: relê preferências e regrava configs externas.
+            self._resync_persistent_app_proxies(local_proxy_active=True)
             self._apps_list_layout_key = None
             self._schedule_refresh_apps_list()
             self.after_idle(self._reload_proxy_form_from_store)
@@ -1539,6 +1676,8 @@ class ProxyManagerApp(ctk.CTk):
         else:
             self._proxy_verified = False
             self._proxy_ip_info = proxy_info if proxy_info.ip else None
+            # Verificação falhou: não deixe Claude/browsers apontando à 7890 morta.
+            self._resync_persistent_app_proxies(local_proxy_active=False)
             detail = verify_msg or config_msg or "Falha na verificação."
             self._sync_auto_mode_header()
             self._update_header_from_processes(self._scanner.cache, preserve_status=True)
@@ -2538,6 +2677,7 @@ class ProxyManagerApp(ctk.CTk):
         self._update_apps_proxy_status_from(processes)
         self._update_header_from_processes(processes)
         self._update_proxy_info_bar()
+        self._update_network_status_strip()
         if not self._auto_config_running:
             self._maybe_fetch_public_ip(processes)
 
@@ -2612,14 +2752,18 @@ class ProxyManagerApp(ctk.CTk):
             return
         if is_running() and not self._auto_config_running:
             was_verified = self._proxy_verified
-            ok, _msg = is_proxy_mode_verified(
-                self.store.proxy, info, self._direct_ip_info
-            )
-            self._proxy_verified = ok
-            if was_verified != ok:
-                self._apps_list_layout_key = None
-                self._schedule_refresh_apps_list()
-                self._update_brand_icon(proxy_on=ok)
+            # Só reavalia com IP válido. Falha transitória de fetch não derruba
+            # um Tor/proxy já verificado (ex.: "PROXY TESTANDO" eterno).
+            if info.ip:
+                ok, _msg = is_proxy_mode_verified(
+                    self.store.proxy, info, self._direct_ip_info
+                )
+                self._proxy_verified = ok
+                if was_verified != ok:
+                    self._apps_list_layout_key = None
+                    self._schedule_refresh_apps_list()
+                    self._update_brand_icon(proxy_on=ok)
+                    self._sync_global_switch_label()
         self._update_ip_display()
         self._sync_auto_mode_header()
         self._update_apps_proxy_status_from(self._scanner.cache)
@@ -2767,7 +2911,9 @@ class ProxyManagerApp(ctk.CTk):
             self.global_proxy_var.set(is_running())
             self._sync_global_switch_label()
         self._sync_auto_mode_header()
-        self._sync_ssh_socks_button()
+        # Durante troca Tor/Rápido, não reconsultar o túnel S5 (evita ruído/lag).
+        if not self._auto_config_running:
+            self._sync_ssh_socks_button(update_svc=False)
         if is_running() and self._proxy_verified:
             self._maybe_fetch_public_ip(processes, force=False)
 
@@ -2849,6 +2995,8 @@ class ProxyManagerApp(ctk.CTk):
                         f"{'ões' if pending > 1 else ''})",
                         "#fbbf24",
                     )
+            if app and app.use_socks5 and ssh_socks.is_running():
+                return f"● Rodando no SOCKS5 (:{ssh_socks.DEFAULT_LOCAL_PORT})", SOCKS5_COLOR
             return "○ Rodando sem proxy", "#94a3b8"
         if app and self._proxy_verified and self.store.proxy.source != "direct":
             mode = self._proxy_mode_short_label()
@@ -2873,6 +3021,8 @@ class ProxyManagerApp(ctk.CTk):
                     return f"◐ {mode} configurado\n(reinicie o Claude)", "#fbbf24"
             if app.id == "firefox" and firefox_proxy_active():
                 return f"◐ {mode} no perfil\n(reinicie o Firefox)", "#fbbf24"
+        if app and app.use_socks5 and ssh_socks.is_running():
+            return f"○ SOCKS5 pronto (:{ssh_socks.DEFAULT_LOCAL_PORT})\napp ainda não iniciado", SOCKS5_COLOR
         return "○ Parado", "#64748b"
 
     def _touch_recent_app(self, app: AppRule) -> None:
@@ -2884,12 +3034,13 @@ class ProxyManagerApp(ctk.CTk):
 
     def _apps_layout_signature(
         self, by_app: dict[str, ProcessInfo]
-    ) -> tuple[frozenset[str], tuple[str, ...], str]:
+    ) -> tuple[frozenset[str], tuple[str, ...], str, frozenset[str]]:
         proxy_active = frozenset(
             aid for aid, proc in by_app.items() if proc.proxy_active and self._proxy_verified
         )
+        socks5_on = frozenset(a.id for a in self.store.apps if a.use_socks5)
         filt = self.app_filter_var.get().strip().lower()
-        return (proxy_active, tuple(self.store.recent_app_ids), filt)
+        return (proxy_active, tuple(self.store.recent_app_ids), filt, socks5_on)
 
     def _sort_apps_for_display(
         self,
@@ -2900,7 +3051,7 @@ class ProxyManagerApp(ctk.CTk):
 
         def sort_key(app: AppRule) -> tuple:
             proc = by_app.get(app.id)
-            proxy_active = self._app_has_verified_proxy(app.id, by_app)
+            proxy_active = self._app_active_for_sorting(app.id, by_app)
             recent_rank = recent_order.get(app.id, 9999)
             return (
                 0 if proxy_active else (1 if recent_rank < 9999 else 2),
@@ -2920,7 +3071,7 @@ class ProxyManagerApp(ctk.CTk):
 
         for app in sorted_apps:
             proc = by_app.get(app.id)
-            if self._app_has_verified_proxy(app.id, by_app):
+            if self._app_active_for_sorting(app.id, by_app):
                 proxy_on.append(app)
             elif app.id in recent_order:
                 recent.append(app)
@@ -2941,6 +3092,17 @@ class ProxyManagerApp(ctk.CTk):
                 (CATEGORY_LABELS.get(category, category.title()), by_category[category])
             )
         return sections
+
+    def _app_active_for_sorting(self, app_id: str, by_app: dict[str, ProcessInfo]) -> bool:
+        """Vai pro topo da lista: proxy (gost/Tor) verificado OU SOCKS5 ligado pro app.
+
+        O software existe pra ligar/desligar essas condições — qualquer uma
+        das duas conta como "ativo" pra ordenação, independente da outra.
+        """
+        if self._app_has_verified_proxy(app_id, by_app):
+            return True
+        app = self.store.get_app(app_id)
+        return bool(app and app.use_socks5)
 
     def _app_has_verified_proxy(self, app_id: str, by_app: dict[str, ProcessInfo]) -> bool:
         if not self._proxy_verified:
@@ -3187,13 +3349,9 @@ class ProxyManagerApp(ctk.CTk):
                 self._stop_proxy(cur, revert_toggle=enabled_var)
                 self._schedule_refresh_apps_list()
 
-        ctk.CTkSwitch(
-            card,
-            text="",
-            width=46,
-            variable=enabled_var,
-            command=on_enabled_change,
-        ).grid(row=0, column=0, rowspan=2, padx=(12, 8), pady=12)
+        route_tiles = self._render_app_route_tiles(
+            card, app_box, enabled_var, on_enabled_change, row=0, col=0
+        )
 
         title_label = ctk.CTkLabel(card, text="", font=self._card_title_font)
         title_label.grid(row=0, column=1, sticky="w", pady=(10, 0))
@@ -3241,10 +3399,110 @@ class ProxyManagerApp(ctk.CTk):
             "var": enabled_var,
             "app_box": app_box,
             "iface_tiles": iface_tiles,
+            "route_tiles": route_tiles,
             "sub_label": sub_label,
             "action_menu": action_menu,
         }
         self._refresh_app_card_content(app, self._app_cards[app.id], by_app)
+
+    @staticmethod
+    def _style_route_tile(tile: ctk.CTkFrame, label: ctk.CTkLabel, active: bool, color: str = "#4ade80") -> None:
+        if active:
+            tile.configure(border_color=color, fg_color="#1e3a2f")
+            label.configure(text_color=color)
+        else:
+            tile.configure(border_color="#475569", fg_color="#334155")
+            label.configure(text_color="#94a3b8")
+
+    def _render_app_route_tiles(
+        self,
+        parent: ctk.CTkFrame,
+        app_box: list[AppRule],
+        enabled_var: ctk.BooleanVar,
+        on_enabled_change,
+        *,
+        row: int,
+        col: int,
+    ) -> dict:
+        """Três ícones (Tor / Rápido / SOCKS5) no lugar do interruptor único —
+        mostram de forma explícita qual rota está ativa para este app.
+
+        Tor e Rápido refletem o mesmo estado 'usa proxy' do app (o gost só
+        tem uma rota configurada por vez, a do modo global); clicar em
+        qualquer um dos dois liga/desliga esse proxy. SOCKS5 é independente
+        (túnel SSH próprio) e tem seu próprio clique.
+        """
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(row=row, column=col, rowspan=2, padx=(10, 4), pady=6)
+
+        def _mk_tile(text: str) -> tuple[ctk.CTkFrame, ctk.CTkLabel]:
+            tile = ctk.CTkFrame(
+                frame,
+                width=30,
+                height=30,
+                corner_radius=7,
+                fg_color="#334155",
+                border_width=1,
+                border_color="#475569",
+                cursor="hand2",
+            )
+            tile.pack(side="left", padx=2)
+            tile.pack_propagate(False)
+            lbl = ctk.CTkLabel(tile, text=text, font=ctk.CTkFont(size=13, weight="bold"))
+            lbl.place(relx=0.5, rely=0.5, anchor="center")
+            return tile, lbl
+
+        tor_tile, tor_lbl = _mk_tile("🧅")
+        fast_tile, fast_lbl = _mk_tile("⚡")
+        s5_tile, s5_lbl = _mk_tile("S5")
+
+        def _toggle_proxy(_e=None) -> None:
+            enabled_var.set(not enabled_var.get())
+            on_enabled_change()
+
+        for w in (tor_tile, tor_lbl, fast_tile, fast_lbl):
+            w.bind("<Button-1>", _toggle_proxy)
+
+        def _toggle_socks5(_e=None) -> None:
+            cur = app_box[0]
+            cur.use_socks5 = not cur.use_socks5
+            self.store.update_app(cur)
+            self._style_route_tile(s5_tile, s5_lbl, cur.use_socks5, color=SOCKS5_COLOR)
+            self._apps_list_layout_key = None
+            self._schedule_refresh_apps_list()
+            if cur.use_socks5:
+                self._toast(
+                    f"{cur.name} vai sair pelo túnel SSH SOCKS5 (127.0.0.1:"
+                    f"{ssh_socks.DEFAULT_LOCAL_PORT}) na próxima vez que for lançado por aqui.\n"
+                    "Apps que não usam variáveis de proxy (ex.: RustDesk) precisam "
+                    "de configuração manual: Settings → Network → Socks5.",
+                    "info",
+                )
+
+                def worker() -> None:
+                    ok, msg = ssh_socks.start_tunnel()
+                    self.after(0, lambda: (self._sync_ssh_socks_button(update_svc=True), self._toast(msg, "success" if ok else "error")))
+
+                threading.Thread(target=worker, daemon=True).start()
+            else:
+                self._toast(f"{cur.name} não usa mais o túnel SOCKS5 (túnel continua ligado para outros apps).", "info")
+
+        for w in (s5_tile, s5_lbl):
+            w.bind("<Button-1>", _toggle_socks5)
+
+        Tooltip(tor_tile, "Tor — clique para ligar/desligar o proxy deste app")
+        Tooltip(fast_tile, "Proxy rápido (gost) — clique para ligar/desligar o proxy deste app")
+        Tooltip(
+            s5_tile,
+            "Túnel SSH SOCKS5 (independente do proxy/Tor) para este app.\n"
+            f"Local: 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}",
+        )
+
+        return {
+            "tor_tile": tor_tile, "tor_lbl": tor_lbl,
+            "fast_tile": fast_tile, "fast_lbl": fast_lbl,
+            "s5_tile": s5_tile, "s5_lbl": s5_lbl,
+        }
 
     def _app_action_menu_values(self, app: AppRule) -> list[str]:
         values: list[str] = []
@@ -3254,6 +3512,27 @@ class ProxyManagerApp(ctk.CTk):
         if app.category == "custom":
             values.append("Remover")
         return values
+
+    def _app_title_color(self, app: AppRule, proxy_active: bool) -> str:
+        """Cor do nome do app: distingue Tor, SOCKS5, os dois juntos, ou outro modo.
+
+        - Só Tor (gost com upstream Tor): laranja (TOR_COLOR).
+        - Só SOCKS5 (túnel SSH próprio do app): azul (SOCKS5_COLOR).
+        - Tor + SOCKS5 juntos: ciano (mistura das duas).
+        - Outro proxy ativo (rápido/gratuito/pago/personalizado): branco (padrão anterior).
+        - Nada ativo: cinza.
+        """
+        is_tor = proxy_active and self.store.proxy.source == "tor"
+        socks5_active = bool(app.use_socks5 and ssh_socks.is_running())
+        if is_tor and socks5_active:
+            return "#22d3ee"
+        if is_tor:
+            return TOR_COLOR
+        if socks5_active:
+            return SOCKS5_COLOR
+        if proxy_active:
+            return "#f8fafc"
+        return "#64748b"
 
     def _refresh_app_card_content(
         self, app: AppRule, bundle: dict, by_app: dict[str, ProcessInfo]
@@ -3269,7 +3548,7 @@ class ProxyManagerApp(ctk.CTk):
             pid_part = f"  ·  PID {proc.pid}" if proc else ""
             title_label.configure(
                 text=f"{app_icon(app.id)}  {app.name}{pid_part}",
-                text_color="#f8fafc" if proxy_active else "#64748b",
+                text_color=self._app_title_color(app, proxy_active),
             )
 
         sub_label = bundle.get("sub_label")
@@ -3295,6 +3574,16 @@ class ProxyManagerApp(ctk.CTk):
             action_menu.set(action_values[0])
 
         self._apply_iface_highlight(bundle.get("iface_tiles"), app)
+
+        route_tiles = bundle.get("route_tiles")
+        if route_tiles is not None:
+            try:
+                is_tor = self.store.proxy.source == "tor"
+                self._style_route_tile(route_tiles["tor_tile"], route_tiles["tor_lbl"], proxy_active and is_tor, color=TOR_COLOR)
+                self._style_route_tile(route_tiles["fast_tile"], route_tiles["fast_lbl"], proxy_active and not is_tor)
+                self._style_route_tile(route_tiles["s5_tile"], route_tiles["s5_lbl"], app.use_socks5, color=SOCKS5_COLOR)
+            except Exception:
+                pass
 
     def _apply_iface_highlight(self, tiles: dict[str, ctk.CTkFrame] | None, app: AppRule) -> None:
         if not tiles:
@@ -3544,6 +3833,16 @@ class ProxyManagerApp(ctk.CTk):
             return
         self._sync_auto_mode_header()
         self._request_scan(min_interval=0, debounce_ms=0)
+        # Mudança de config: se proxy já está validado, reinicia e regrava apps.
+        if (
+            is_running()
+            and self.store.proxy.enabled
+            and self._proxy_verified
+            and not self._auto_config_running
+        ):
+            self._start_proxy_in_background(restart=True)
+        elif not is_running():
+            self._resync_persistent_app_proxies(local_proxy_active=False)
         if not silent:
             self._toast("Configurações salvas.", "success")
 
@@ -3633,7 +3932,11 @@ class ProxyManagerApp(ctk.CTk):
         def worker() -> None:
             stop_watchdog()
             ok, msg = stop_local_proxy()
-            self._clear_browser_proxies_for_apps()
+            # Ao desligar: limpa configs externas e marca preferência Claude como off.
+            self._resync_persistent_app_proxies(
+                local_proxy_active=False,
+                clear_claude_preference=True,
+            )
             self.after(0, lambda: self._finish_global_proxy_off(ok, msg or "Proxy desligado."))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3656,6 +3959,7 @@ class ProxyManagerApp(ctk.CTk):
         notify_proxy_down()
         self._update_brand_icon(proxy_on=False)
         self._update_proxy_info_bar()
+        self._update_network_status_strip()
         if not ok:
             self._toast(msg, "warning")
 
@@ -4896,30 +5200,82 @@ class ProxyManagerApp(ctk.CTk):
     def _update_app_from_dialog(self, app: AppRule) -> None:
         self.store.update_app(app)
 
+    def _shutdown_cleanup_proxy_state(self) -> None:
+        """Destroyer: limpa configs externas e para o proxy local (idempotente)."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        try:
+            stop_watchdog()
+        except Exception:
+            pass
+        try:
+            clear_persistent_app_proxies(self.store.apps, self.store.proxy)
+        except Exception:
+            pass
+        try:
+            force_stop_local_proxy()
+        except Exception:
+            try:
+                stop_local_proxy()
+            except Exception:
+                pass
+        try:
+            self.store.proxy.enabled = False
+            for app in self.store.apps:
+                if is_claude_app(app) and app.use_proxy:
+                    app.use_proxy = False
+            self.store.save()
+        except Exception:
+            pass
+
     def on_closing(self) -> None:
         self._modal_open = False
         self._services_tab_alive = False
-        svc_mod.remove_listener(self._on_svc_update)
-        if self._refresh_job:
-            self.after_cancel(self._refresh_job)
-        if self._iface_refresh_job:
-            self.after_cancel(self._iface_refresh_job)
-        stop_watchdog()
-        if self._tray:
-            self._tray.stop()
-
-        # Ao fechar: limpa proxies de Claude/browsers para que funcionem sem o manager.
-        # Mantém gost em modo direto em vez de matar — apps com HTTP_PROXY env var continuam.
-        self._clear_browser_proxies_for_apps()
-        import copy as _copy
-        direct_proxy = _copy.copy(self.store.proxy)
-        direct_proxy.source = "direct"
         try:
-            restart_local_proxy(direct_proxy)
+            svc_mod.remove_listener(self._on_svc_update)
         except Exception:
-            stop_local_proxy()
+            pass
+        if self._refresh_job:
+            try:
+                self.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+        if self._iface_refresh_job:
+            try:
+                self.after_cancel(self._iface_refresh_job)
+            except Exception:
+                pass
+        if self._tray:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
 
-        self.destroy()
+        # Ao fechar: limpa qualquer config persistente e mata a 7890.
+        self._shutdown_cleanup_proxy_state()
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _on_destroy_signal(self, _signum=None, _frame=None) -> None:
+        """SIGINT/SIGTERM → mesmo path de fechamento limpo."""
+        try:
+            self.after(0, self.on_closing)
+        except Exception:
+            self._shutdown_cleanup_proxy_state()
+
+    def _register_destroy_hooks(self) -> None:
+        """Registra destroyers do sistema (janela, sinais, atexit)."""
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        atexit.register(self._shutdown_cleanup_proxy_state)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, self._on_destroy_signal)
+            except (ValueError, OSError):
+                # Em threads secundárias signal.signal pode falhar.
+                pass
 
 
 def _slug_id(name: str) -> str:
@@ -4928,13 +5284,17 @@ def _slug_id(name: str) -> str:
 
 
 def run() -> None:
-    import signal
-
     app = ProxyManagerApp()
 
     def _raise_existing_instance(_signum=None, _frame=None) -> None:
         app.after(0, lambda: (app.deiconify(), app.lift(), app.focus_force()))
 
-    signal.signal(signal.SIGUSR1, _raise_existing_instance)
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    try:
+        signal.signal(signal.SIGUSR1, _raise_existing_instance)
+    except (ValueError, OSError):
+        pass
+
+    app._register_destroy_hooks()
     app.mainloop()
+    # Garante limpeza se mainloop sair sem WM_DELETE_WINDOW.
+    app._shutdown_cleanup_proxy_state()

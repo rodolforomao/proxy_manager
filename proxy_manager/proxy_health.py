@@ -412,5 +412,6 @@ def wait_for_proxy_verification(
 
 
 def detect_listening_proxy_ports(host: str = "127.0.0.1") -> list[int]:
-    ports = (LOCAL_PORT, 7891, 7897, 1080, 8080, 8888)
+    # Não inclui 1080: é porta do túnel SSH SOCKS (RustDesk), independente do gost/Tor.
+    ports = (LOCAL_PORT, 7891, 7897, 8080, 8888, 9050, 9051)
     return [port for port in ports if is_port_open(host, port)]

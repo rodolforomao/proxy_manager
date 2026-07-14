@@ -77,6 +77,18 @@ print(f"   versão configurada: {version}")
 PY
 }
 
+COMMIT_HASH=""
+
+configure_commit_hash() {
+    local sha
+    sha="$(git rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "$sha" ]]; then
+        COMMIT_HASH="${sha: -6}"
+        echo "$COMMIT_HASH" > proxy_manager/_commit.txt
+        echo "   hash configurado: $COMMIT_HASH"
+    fi
+}
+
 APP_VERSION="$(resolve_build_version "$@")"
 
 DIST="$ROOT/dist/proxy-manager"
@@ -88,6 +100,7 @@ ICON_SRC="$ROOT/assets/icon.png"
 
 echo "==> Configurando versão..."
 configure_version "$APP_VERSION"
+configure_commit_hash
 
 echo "==> Ativando ambiente virtual..."
 if [[ -d .venv ]]; then
@@ -178,7 +191,11 @@ update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
 gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo ""
-echo "✓ Build completo!  v$APP_VERSION"
+if [[ -n "$COMMIT_HASH" ]]; then
+    echo "✓ Build completo!  v$APP_VERSION ($COMMIT_HASH)"
+else
+    echo "✓ Build completo!  v$APP_VERSION"
+fi
 echo "  Executável : $EXE"
 echo "  Atalho     : $DESKTOP_FILE"
 echo "  Menu apps  : $APPS_DESKTOP"

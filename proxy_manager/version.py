@@ -19,6 +19,43 @@ def _version_file_candidates() -> list[Path]:
     return paths
 
 
+def _commit_file_candidates() -> list[Path]:
+    paths: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(meipass) / "proxy_manager" / "_commit.txt")
+    paths.append(Path(__file__).with_name("_commit.txt"))
+    return paths
+
+
+@lru_cache(maxsize=1)
+def app_commit_hash() -> str:
+    """Últimos 6 caracteres do hash do commit atual (gravado no build ou lido via git)."""
+    for path in _commit_file_candidates():
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text[-6:]
+
+    if not getattr(sys, "frozen", False):
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                cwd=_REPO_ROOT,
+            )
+            if out.returncode == 0:
+                sha = out.stdout.strip()
+                if sha:
+                    return sha[-6:]
+        except Exception:
+            pass
+
+    return ""
+
+
 @lru_cache(maxsize=1)
 def app_version() -> str:
     for path in _version_file_candidates():
@@ -50,4 +87,7 @@ def app_version() -> str:
 
 def window_title(suffix: str = "") -> str:
     base = f"Proxy Manager {app_version()}"
+    commit = app_commit_hash()
+    if commit:
+        base = f"{base} ({commit})"
     return f"{base} — {suffix}" if suffix else base
