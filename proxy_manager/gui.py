@@ -95,6 +95,7 @@ from proxy_manager.network import AUTO_INTERFACE, interface_choices, interface_t
 from proxy_manager.process_actions import read_process_cmdline, relaunch_process
 from proxy_manager.process_cache import ProcessScanner
 from proxy_manager.process_monitor import find_process_for_app, summary_counts
+from proxy_manager.terminal_proxy import is_terminal_app, launch_proxy_terminal
 from proxy_manager.tooltip import Tooltip
 from proxy_manager.proxy_env import has_active_proxy, read_process_proxy_env
 from proxy_manager.proxy_health import (
@@ -4290,6 +4291,10 @@ class ProxyManagerApp(ctk.CTk):
             self._start_browser_with_proxy(app)
             return
 
+        if is_terminal_app(app):
+            self._start_terminal_with_proxy(app)
+            return
+
         running = find_process_for_app(
             app, self.store.apps, self.store.proxy, self._scanner.cache
         )
@@ -4329,6 +4334,32 @@ class ProxyManagerApp(ctk.CTk):
             return
 
         self._launch_app(app, use_proxy=True)
+
+    def _start_terminal_with_proxy(self, app: AppRule) -> None:
+        """Sempre abre uma janela de terminal NOVA e isolada com o proxy —
+        nunca fecha/reinicia terminais já abertos (Cursor, Claude Code etc.)."""
+        warnings = self._ensure_proxy_for_launch()
+        if warnings is None:
+            self._sync_app_toggle(app.id, False, persist=True)
+            return
+
+        try:
+            proc = launch_proxy_terminal(self.store.proxy, app)
+        except Exception as exc:
+            self._sync_app_toggle(app.id, False, persist=True)
+            self._toast(str(exc), "error")
+            return
+
+        app.use_proxy = True
+        app.enabled = True
+        self.store.update_app(app)
+        self._touch_recent_app(app)
+        self._toast(
+            f"Novo terminal aberto com proxy (janela laranja, PID {proc.pid}).\n"
+            "Os terminais que já estavam abertos (Cursor, Claude Code, etc.) "
+            "não foram tocados.",
+            "success",
+        )
 
     def _start_browser_with_proxy(self, app: AppRule) -> None:
         """Nunca fecha um navegador que já está aberto: se o clicado já estiver rodando,
@@ -4520,6 +4551,18 @@ class ProxyManagerApp(ctk.CTk):
 
         if is_browser_app(app):
             self._stop_browser_proxy(app, revert_toggle=revert_toggle)
+            return
+
+        if is_terminal_app(app):
+            app.use_proxy = False
+            app.enabled = False
+            self.store.update_app(app)
+            self._toast(
+                f"Interruptor de {app.name} desligado. Isso não fecha a janela "
+                "laranja já aberta — feche-a manualmente quando terminar de usar "
+                "o proxy. A próxima ativação abre outra janela nova.",
+                "info",
+            )
             return
 
         running = find_process_for_app(
