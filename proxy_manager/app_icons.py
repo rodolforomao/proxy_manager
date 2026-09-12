@@ -33,6 +33,9 @@ APP_ICONS: dict[str, str] = {
     "pip": "🐍",
     "wget": "🔗",
     "openai": "💡",
+    "liquid-testnet": "💧",
+    "liquid-mainnet": "💧",
+    "liquid-mainnet-light": "💧",
 }
 
 APP_SHORT_NAMES: dict[str, str] = {
@@ -52,6 +55,9 @@ APP_SHORT_NAMES: dict[str, str] = {
     "pip": "Python",
     "wget": "curl",
     "openai": "ChatGPT",
+    "liquid-testnet": "LQ Test",
+    "liquid-mainnet": "LQ Main",
+    "liquid-mainnet-light": "LQ Light",
 }
 
 

@@ -14,7 +14,7 @@ from typing import Callable
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
-from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, scan_installed_apps
+from proxy_manager.app_discovery import InstalledApp, list_add_app_candidates, patterns_for_installed_app, scan_installed_apps
 from proxy_manager.app_icons import FEATURED_APP_IDS, app_icon, app_short_name
 from proxy_manager.app_proxy_sync import (
     clear_persistent_app_proxies,
@@ -44,6 +44,17 @@ from proxy_manager.claude_proxy import (
     list_claude_pids,
     prepare_claude_proxy,
 )
+from proxy_manager.elements_proxy import (
+    any_target_proxy_configured,
+    apply_elements_proxy,
+    conf_has_proxy,
+    elements_status_label,
+    ensure_tor_bridge,
+    is_elements_app,
+    start_bridge_watchdog,
+    stop_bridge_watchdog,
+    stop_tor_bridge_if_unused,
+)
 from proxy_manager.config import ConfigStore
 from proxy_manager.countries import country_code_from_label, country_label, country_option_labels
 from proxy_manager.local_proxy import (
@@ -64,6 +75,7 @@ from proxy_manager.local_proxy import (
 
 try:
     from proxy_manager.notifications import (
+        notify,
         notify_proxy_up,
         notify_proxy_down,
         notify_proxy_error,
@@ -72,6 +84,7 @@ try:
     _NOTIFY_AVAILABLE = True
 except ImportError:
     _NOTIFY_AVAILABLE = False
+    def notify(title: str, body: str = "", urgency: str = "normal") -> None: pass  # noqa: E704
     def notify_proxy_up(route: str) -> None: pass  # noqa: E704
     def notify_proxy_down(reason: str = "") -> None: pass  # noqa: E704
     def notify_proxy_error(reason: str) -> None: pass  # noqa: E704
@@ -88,7 +101,7 @@ except Exception:
         def start(self, **kw): pass
         def update(self, **kw): pass
         def stop(self): pass
-from proxy_manager.models import LOCAL_PORT, AppRule, ProcessInfo
+from proxy_manager.models import LOCAL_PORT, AppRule, ProcessInfo, SshTunnelSettings
 import proxy_manager.service_status as svc_mod
 from proxy_manager.service_status import STATE_COLORS, STATE_LABELS
 from proxy_manager.network import AUTO_INTERFACE, interface_choices, interface_tooltip, list_interfaces, resolve_interface_label
@@ -137,6 +150,7 @@ from proxy_manager import ssh_socks_tunnel as ssh_socks
 CATEGORY_LABELS = {
     "ai": "IA / Assistentes",
     "browser": "Navegadores",
+    "blockchain": "Blockchain",
     "dev": "Desenvolvimento",
     "social": "Comunicação",
     "media": "Mídia",
@@ -246,6 +260,8 @@ class ProxyManagerApp(ctk.CTk):
         self._start_iface_refresh()
         if self.store.proxy.enabled:
             self.after(1200, self._start_watchdog)
+        self.after(150, self._reconcile_elements_bridge_on_startup)
+        self.after(1200, self._start_elements_bridge_watchdog)
         if tray_available():
             self.after(500, self._start_tray)
         else:
@@ -415,6 +431,36 @@ class ProxyManagerApp(ctk.CTk):
 
         start_watchdog(self.store.proxy, on_watchdog_event)
 
+    # ── Watchdog do bridge Tor do Elements/Liquid ─────────────────────────────
+
+    def _reconcile_elements_bridge_on_startup(self) -> None:
+        """Se algum app Elements já tinha Tor no conf de uma sessão anterior,
+        garante que o bridge subiu de novo — ele não sobrevive a reboot/crash
+        sozinho e antes só era (re)criado quando alguém clicava no toggle."""
+        if not any_target_proxy_configured():
+            return
+
+        def worker() -> None:
+            ok, msg = ensure_tor_bridge()
+            if not ok:
+                self.after(
+                    0,
+                    lambda m=msg: self._toast(f"Bridge Tor (Liquid) não subiu: {m}", "error"),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_elements_bridge_watchdog(self) -> None:
+        def on_watchdog_event(ok: bool, msg: str) -> None:
+            if ok:
+                notify("Bridge Tor (Liquid) recuperado", msg)
+            else:
+                notify("Bridge Tor (Liquid) caiu", msg, urgency="critical")
+            self.after(0, lambda: self._request_scan(min_interval=2.0))
+            self.after(0, self._schedule_refresh_apps_list)
+
+        start_bridge_watchdog(lambda: self.store.apps, on_watchdog_event)
+
     # ── Tray ────────────────────────────────────────────────────────────────
 
     def _tray_mode(self) -> str:
@@ -451,8 +497,12 @@ class ProxyManagerApp(ctk.CTk):
             on_quit=self._tray_quit,
             on_toggle_proxy=self._toggle_global_proxy,
         )
-        self._tray.start(mode=self._tray_mode(), status=self._tray_status())
-        svc_mod.update(svc_mod.SVC_TRAY, "ok", "Ícone de bandeja ativo")
+        try:
+            self._tray.start(mode=self._tray_mode(), status=self._tray_status())
+            svc_mod.update(svc_mod.SVC_TRAY, "ok", "Ícone de bandeja ativo")
+        except Exception as exc:
+            self._tray = None
+            svc_mod.update(svc_mod.SVC_TRAY, "parado", f"Bandeja indisponível: {exc}")
 
     def _tray_show(self) -> None:
         self.after(0, lambda: (self.deiconify(), self.lift(), self.focus_force()))
@@ -1177,7 +1227,7 @@ class ProxyManagerApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                enabled, msg = ssh_socks.toggle_tunnel()
+                enabled, msg = ssh_socks.toggle_tunnel(self.store.ssh_tunnel)
             except Exception as exc:
                 enabled, msg = False, str(exc)
 
@@ -1948,6 +1998,70 @@ class ProxyManagerApp(ctk.CTk):
             hover_color="#991b1b",
             command=self._delete_selected_profile,
         ).grid(row=0, column=3)
+
+        # ── Túnel SSH SOCKS5 (RustDesk) ────────────────────────────────────
+        row += 1
+        ctk.CTkLabel(
+            tab,
+            text="Túnel SSH SOCKS5 (RustDesk)",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(16, 4))
+        row += 1
+        ctk.CTkLabel(
+            tab,
+            text=(
+                "Credenciais do servidor SSH usado só pelo botão S5 (RustDesk). "
+                "Próprias deste app — independentes do proxy/Tor acima."
+            ),
+            text_color="#94a3b8",
+            font=ctk.CTkFont(size=12),
+            wraplength=560,
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+        row += 1
+
+        ssh = self.store.ssh_tunnel
+        ctk.CTkLabel(tab, text="Host:").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        self.ssh_host_entry = ctk.CTkEntry(tab, placeholder_text="ex.: 203.0.113.10")
+        self.ssh_host_entry.insert(0, ssh.host)
+        self.ssh_host_entry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ctk.CTkLabel(tab, text="Usuário:").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        self.ssh_user_entry = ctk.CTkEntry(tab)
+        self.ssh_user_entry.insert(0, ssh.user)
+        self.ssh_user_entry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ctk.CTkLabel(tab, text="Porta SSH:").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        self.ssh_port_entry = ctk.CTkEntry(tab)
+        self.ssh_port_entry.insert(0, str(ssh.port))
+        self.ssh_port_entry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ctk.CTkLabel(tab, text="Senha:").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        self.ssh_password_entry = ctk.CTkEntry(tab, show="•")
+        self.ssh_password_entry.insert(0, ssh.password)
+        self.ssh_password_entry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ctk.CTkLabel(tab, text="Chave SSH\n(opcional):").grid(
+            row=row, column=0, sticky="nw", padx=12, pady=6
+        )
+        self.ssh_key_entry = ctk.CTkEntry(
+            tab, placeholder_text="/home/usuario/.ssh/id_rsa (vazio = usar senha)"
+        )
+        self.ssh_key_entry.insert(0, ssh.key_path)
+        self.ssh_key_entry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        row += 1
+
+        ctk.CTkButton(
+            tab,
+            text="Salvar túnel SSH",
+            fg_color=SOCKS5_COLOR,
+            hover_color="#3b82f6",
+            command=self._save_ssh_tunnel_settings,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 12))
 
         row += 1
         info = ctk.CTkTextbox(tab, height=140)
@@ -2963,6 +3077,8 @@ class ProxyManagerApp(ctk.CTk):
     def _status_from_proc(
         self, proc: ProcessInfo | None, app: AppRule | None = None
     ) -> tuple[str, str]:
+        if app and is_elements_app(app):
+            return elements_status_label(app)
         if proc and proc.proxy_active:
             if self._auto_config_running or not self._proxy_verified:
                 return "◐ Verificando proxy…", "#fbbf24"
@@ -3106,9 +3222,13 @@ class ProxyManagerApp(ctk.CTk):
         return bool(app and app.use_socks5)
 
     def _app_has_verified_proxy(self, app_id: str, by_app: dict[str, ProcessInfo]) -> bool:
+        app = self.store.get_app(app_id)
+        # Elements usa Tor nativo (conf) — independente do gost :7890 / _proxy_verified.
+        if app and is_elements_app(app):
+            return conf_has_proxy(app.id) or bool(app.use_proxy)
+
         if not self._proxy_verified:
             return False
-        app = self.store.get_app(app_id)
         if app and is_claude_app(app):
             if app.enabled or app.use_proxy or claude_settings_proxy_active():
                 active_sess, total_sess = claude_session_stats()
@@ -3481,7 +3601,7 @@ class ProxyManagerApp(ctk.CTk):
                 )
 
                 def worker() -> None:
-                    ok, msg = ssh_socks.start_tunnel()
+                    ok, msg = ssh_socks.start_tunnel(self.store.ssh_tunnel)
                     self.after(0, lambda: (self._sync_ssh_socks_button(update_svc=True), self._toast(msg, "success" if ok else "error")))
 
                 threading.Thread(target=worker, daemon=True).start()
@@ -3507,7 +3627,7 @@ class ProxyManagerApp(ctk.CTk):
 
     def _app_action_menu_values(self, app: AppRule) -> list[str]:
         values: list[str] = []
-        if app.command.strip():
+        if app.command.strip() or is_elements_app(app):
             values.append("Ligar proxy")
         values.extend(["Parar proxy", "Editar"])
         if app.category == "custom":
@@ -3523,6 +3643,8 @@ class ProxyManagerApp(ctk.CTk):
         - Outro proxy ativo (rápido/gratuito/pago/personalizado): branco (padrão anterior).
         - Nada ativo: cinza.
         """
+        if is_elements_app(app) and proxy_active:
+            return TOR_COLOR
         is_tor = proxy_active and self.store.proxy.source == "tor"
         socks5_active = bool(app.use_socks5 and ssh_socks.is_running())
         if is_tor and socks5_active:
@@ -3847,6 +3969,22 @@ class ProxyManagerApp(ctk.CTk):
         if not silent:
             self._toast("Configurações salvas.", "success")
 
+    def _save_ssh_tunnel_settings(self) -> None:
+        try:
+            port = int(self.ssh_port_entry.get().strip() or "22")
+        except ValueError:
+            self._toast("Porta SSH inválida.", "error")
+            return
+        self.store.ssh_tunnel = SshTunnelSettings(
+            host=self.ssh_host_entry.get().strip(),
+            user=self.ssh_user_entry.get().strip() or "root",
+            port=port,
+            password=self.ssh_password_entry.get(),
+            key_path=self.ssh_key_entry.get().strip(),
+        )
+        self.store.save()
+        self._toast("Túnel SSH salvo.", "success")
+
     def _sync_global_switch_label(self) -> None:
         if is_running() and self._proxy_verified:
             self.global_proxy_switch.configure(text="PROXY LIGADO", text_color="#4ade80")
@@ -4080,8 +4218,9 @@ class ProxyManagerApp(ctk.CTk):
             "Isso vai:\n"
             "• Parar o proxy (porta 7890) completamente\n"
             "• Encerrar apps que estavam usando proxy\n"
-            "• Remover proxy do Claude Code (~/.claude/settings.json)\n"
+            "• Remover proxy do Claude Code (settings.json de todas as contas)\n"
             "• Remover proxy do Firefox (user.js)\n"
+            "• Remover Tor dos nós Liquid/Elements (conf)\n"
             "• Desativar proxy em todos os aplicativos\n\n"
             "Continuar?",
         ):
@@ -4109,7 +4248,7 @@ class ProxyManagerApp(ctk.CTk):
                 except Exception:
                     pass
 
-            # Limpa configurações de proxy (user.js, claude settings)
+            # Limpa configurações de proxy (user.js, claude settings, elements conf)
             for app in self.store.apps:
                 if is_claude_app(app):
                     try:
@@ -4121,9 +4260,18 @@ class ProxyManagerApp(ctk.CTk):
                         prepare_browser_proxy(app, self.store.proxy, use_proxy=False)
                     except Exception:
                         pass
+                elif is_elements_app(app):
+                    try:
+                        from proxy_manager.elements_proxy import write_conf_proxy
+
+                        write_conf_proxy(app.id, enable=False)
+                    except Exception:
+                        pass
                 app.use_proxy = False
                 app.enabled = True
                 self.store.update_app(app)
+
+            stop_tor_bridge_if_unused(self.store.apps)
 
             # Para o gost completamente — não reinicia em modo direto.
             # Apps encerrados acima serão reabertos pelo usuário sem HTTP_PROXY.
@@ -4203,8 +4351,43 @@ class ProxyManagerApp(ctk.CTk):
         self._sync_global_switch_label()
         return []
 
+    def _apply_elements_proxy(self, app: AppRule, *, use_proxy: bool) -> None:
+        """Liga/desliga Tor nativo no Elements (conf + bridge + recreate)."""
+        self._touch_recent_app(app)
+        self._toast(
+            f"{'Ativando' if use_proxy else 'Desativando'} Tor em {app.name}…",
+            "info",
+        )
+
+        def worker() -> None:
+            try:
+                ok, msg = apply_elements_proxy(app, use_proxy=use_proxy)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+
+            def finish() -> None:
+                if ok:
+                    self.store.update_app(app)
+                    if not use_proxy:
+                        stop_tor_bridge_if_unused(self.store.apps)
+                    self._sync_app_toggle(app.id, use_proxy, persist=True)
+                    self._apps_list_layout_key = None
+                    self._request_scan(min_interval=0, debounce_ms=0)
+                    self._schedule_refresh_apps_list()
+                    self._toast(msg, "success")
+                else:
+                    app.use_proxy = not use_proxy
+                    app.enabled = not use_proxy
+                    self.store.update_app(app)
+                    self._sync_app_toggle(app.id, not use_proxy, persist=True)
+                    self._toast(msg, "error")
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _apply_claude_proxy(self, app: AppRule, *, use_proxy: bool) -> None:
-        """Configura ~/.claude/settings.json — método oficial para rede bloqueada."""
+        """Configura settings.json do Claude (default + contas CLAUDE_CONFIG_DIR)."""
         if self._ensure_proxy_for_launch() is None and use_proxy:
             self._sync_app_toggle(app.id, False, persist=True)
             return
@@ -4214,7 +4397,7 @@ class ProxyManagerApp(ctk.CTk):
                 raise OSError("settings.json não ficou com proxy após gravar")
         except OSError as exc:
             self._sync_app_toggle(app.id, False, persist=True)
-            self._toast(f"Não foi possível gravar ~/.claude/settings.json:\n{exc}", "error")
+            self._toast(f"Não foi possível gravar settings.json do Claude:\n{exc}", "error")
             return
 
         app.use_proxy = use_proxy
@@ -4239,7 +4422,7 @@ class ProxyManagerApp(ctk.CTk):
                             text_color="#4ade80",
                         )
                         _body = (
-                            f"Proxy gravado em ~/.claude/settings.json.\n"
+                            f"Proxy gravado nos settings.json do Claude (incl. contas).\n"
                             f"Proxy local: {url}\n"
                             f"Teste: ✓ {reach_msg}\n\n"
                             f"{hint}"
@@ -4252,7 +4435,7 @@ class ProxyManagerApp(ctk.CTk):
                             text_color="#f97316",
                         )
                         _body = (
-                            f"Proxy gravado em ~/.claude/settings.json.\n"
+                            f"Proxy gravado nos settings.json do Claude (incl. contas).\n"
                             f"Proxy local: {url}\n"
                             f"Teste: ✗ {reach_msg}\n\n"
                             "Verifique se o proxy externo está funcionando e tente novamente.\n\n"
@@ -4267,7 +4450,7 @@ class ProxyManagerApp(ctk.CTk):
             threading.Thread(target=_test_and_show, daemon=True).start()
         else:
             self._toast(
-                "Proxy removido de ~/.claude/settings.json. "
+                "Proxy removido dos settings.json do Claude. "
                 + (
                     self._claude_restart_hint()
                     if list_claude_pids()
@@ -4277,6 +4460,10 @@ class ProxyManagerApp(ctk.CTk):
             )
 
     def _start_with_proxy(self, app: AppRule) -> None:
+        if is_elements_app(app):
+            self._apply_elements_proxy(app, use_proxy=True)
+            return
+
         if not app.command.strip():
             self._toast("Nenhum comando configurado para este app.", "warning")
             return
@@ -4534,11 +4721,26 @@ class ProxyManagerApp(ctk.CTk):
         self._toast(f"Proxy desligado para {app.name}.", "info")
 
     def _stop_proxy(self, app: AppRule, *, revert_toggle: ctk.BooleanVar | None = None) -> None:
+        if is_elements_app(app):
+            if revert_toggle is not None:
+                if not messagebox.askyesno(
+                    "Parar Tor",
+                    f"Remover Tor do {app.name} (conf + recreate se estiver rodando)?",
+                ):
+                    self._toggle_syncing.add(app.id)
+                    revert_toggle.set(True)
+                    self._toggle_syncing.discard(app.id)
+                    app.enabled = True
+                    self.store.update_app(app)
+                    return
+            self._apply_elements_proxy(app, use_proxy=False)
+            return
+
         if is_claude_app(app):
             if revert_toggle is not None:
                 if not messagebox.askyesno(
                     "Parar proxy",
-                    "Remover proxy do Claude Code (~/.claude/settings.json)?",
+                    "Remover proxy do Claude Code (todas as contas / settings.json)?",
                 ):
                     self._toggle_syncing.add(app.id)
                     revert_toggle.set(True)
@@ -4864,11 +5066,14 @@ class ProxyManagerApp(ctk.CTk):
         )
 
     def _app_dialog_from_pick(self, picked: InstalledApp) -> None:
-        slug = re.sub(r"[^a-z0-9]+", "", picked.name.lower())
+        patterns = patterns_for_installed_app(picked)
+        if not patterns:
+            slug = re.sub(r"[^a-z0-9]+", "", picked.name.lower())
+            patterns = [slug] if slug else [picked.name.lower()]
         draft = AppRule(
             id=_slug_id(picked.name),
             name=picked.name,
-            patterns=[slug] if slug else [picked.name.lower()],
+            patterns=patterns,
             command=picked.command,
             notes=picked.comment,
         )
@@ -5250,6 +5455,10 @@ class ProxyManagerApp(ctk.CTk):
         self._shutdown_done = True
         try:
             stop_watchdog()
+        except Exception:
+            pass
+        try:
+            stop_bridge_watchdog()
         except Exception:
             pass
         try:

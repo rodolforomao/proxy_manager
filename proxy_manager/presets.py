@@ -12,7 +12,7 @@ def default_apps() -> list[AppRule]:
             use_proxy=False,
             category="ai",
             command="claude",
-            notes="CLI — proxy via ~/.claude/settings.json (HTTP 127.0.0.1:7890)",
+            notes="CLI — proxy via settings.json (~/.claude e ~/.claude-conta*)",
         ),
         AppRule(
             id="cursor",
@@ -144,5 +144,44 @@ def default_apps() -> list[AppRule]:
             category="ai",
             command="",
             notes="Funciona sem proxy",
+        ),
+        AppRule(
+            id="liquid-testnet",
+            name="Liquid Testnet",
+            patterns=["/config/elements.conf", "liquid-elementsd"],
+            use_proxy=False,
+            enabled=False,
+            category="blockchain",
+            command="elements-tor",
+            notes=(
+                "Tor nativo no elementsd (proxy= SOCKS5). "
+                "Não usa gost :7890. Edita elements.conf e recreia o container se estiver up."
+            ),
+        ),
+        AppRule(
+            id="liquid-mainnet",
+            name="Liquid Mainnet",
+            patterns=["elements-mainnet.conf", "liquid-elementsd-mainnet"],
+            use_proxy=False,
+            enabled=False,
+            category="blockchain",
+            command="elements-tor",
+            notes=(
+                "Tor nativo no elementsd mainnet full. "
+                "Não usa gost :7890. Edita elements-mainnet.conf e recreia se estiver up."
+            ),
+        ),
+        AppRule(
+            id="liquid-mainnet-light",
+            name="Liquid Mainnet (leve)",
+            patterns=["elements-mainnet-light.conf", "liquid-elementsd-mainnet-light"],
+            use_proxy=False,
+            enabled=False,
+            category="blockchain",
+            command="elements-tor",
+            notes=(
+                "Tor nativo no elementsd mainnet pruned. "
+                "Não usa gost :7890. Edita elements-mainnet-light.conf e recreia se estiver up."
+            ),
         ),
     ]

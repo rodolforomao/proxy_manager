@@ -103,21 +103,26 @@ configure_version "$APP_VERSION"
 configure_commit_hash
 
 echo "==> Ativando ambiente virtual..."
-if [[ -d .venv ]]; then
-    source .venv/bin/activate
-else
-    echo "ERRO: .venv não encontrado. Crie com: python3 -m venv .venv && pip install -r requirements.txt"
+PYTHON="$ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERRO: .venv não encontrado. Crie com:"
+    echo "  python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt pyinstaller"
+    exit 1
+fi
+if ! "$PYTHON" -c "import sys; assert sys.prefix.endswith('.venv')" 2>/dev/null; then
+    echo "AVISO: .venv parece corrompido (caminho antigo?). Recrie com:"
+    echo "  rm -rf .venv && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt pyinstaller"
     exit 1
 fi
 
 echo "==> Verificando PyInstaller..."
-if ! python -m PyInstaller --version &>/dev/null; then
+if ! "$PYTHON" -m PyInstaller --version &>/dev/null; then
     echo "Instalando PyInstaller..."
-    pip install pyinstaller --quiet
+    "$PYTHON" -m pip install pyinstaller --quiet
 fi
 
 echo "==> Gerando ícone..."
-python3 - <<'PYEOF'
+"$PYTHON" - <<'PYEOF'
 from proxy_manager.brand_icon import make_brand_icon
 from pathlib import Path
 assets = Path("assets")
@@ -128,7 +133,7 @@ print("   icon.png gerado (256x256)")
 PYEOF
 
 echo "==> Compilando com PyInstaller..."
-python -m PyInstaller proxy-manager.spec \
+"$PYTHON" -m PyInstaller proxy-manager.spec \
     --noconfirm \
     --clean \
     2>&1 | grep -E "^(INFO|WARNING|ERROR|Building|Appending|Copying|\s*(.*\.py|ERROR))" || true
@@ -152,7 +157,7 @@ echo "    Tamanho: $(du -sh "$DIST" | cut -f1)"
 
 echo "==> Instalando ícones e atalhos..."
 
-python3 - <<PYEOF
+"$PYTHON" - <<PYEOF
 from pathlib import Path
 from proxy_manager.brand_icon import make_brand_icon
 

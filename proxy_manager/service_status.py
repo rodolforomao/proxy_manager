@@ -172,6 +172,7 @@ SVC_TOR        = "tor"
 SVC_IFACE      = "iface_refresh"
 SVC_TRAY       = "tray"
 SVC_SSH_SOCKS  = "ssh_socks"
+SVC_ELEMENTS_BRIDGE = "elements_bridge"
 
 # Pré-registra os serviços conhecidos
 register(SVC_GOST,       "Proxy local (gost)")
@@ -182,4 +183,5 @@ register(SVC_TOR,        "Tor")
 register(SVC_IFACE,      "Refresh de interfaces")
 register(SVC_TRAY,       "Bandeja do sistema")
 register(SVC_SSH_SOCKS,  "Túnel SOCKS5 (SSH)")
+register(SVC_ELEMENTS_BRIDGE, "Bridge Tor (Elements/Liquid)")
 register("ui",           "Interface")

@@ -4,14 +4,14 @@ import json
 import os
 from pathlib import Path
 
-from proxy_manager.models import LOCAL_PORT, AppRule, ProxySettings
+from proxy_manager.models import LOCAL_PORT, AppRule, ProxySettings, SshTunnelSettings
 from proxy_manager.network import AUTO_INTERFACE
 from proxy_manager.presets import default_apps
 from proxy_manager.profiles import ProxyProfile
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CONFIG_VERSION = 15
+CONFIG_VERSION = 17
 RECENT_APPS_MAX = 20
 
 
@@ -59,12 +59,14 @@ class ConfigStore:
         self.recent_app_ids: list[str] = []
         self.profiles: list[ProxyProfile] = []
         self.active_profile: str = ""
+        self.ssh_tunnel = SshTunnelSettings()
         self.load()
 
     def load(self) -> None:
         if not self.path.exists():
             self.proxy = ProxySettings()
             self.apps = default_apps()
+            self.ssh_tunnel = SshTunnelSettings()
             self.save()
             return
 
@@ -103,6 +105,15 @@ class ConfigStore:
         self.recent_app_ids: list[str] = list(data.get("recent_app_ids", []))
         self.profiles = [ProxyProfile.from_dict(p) for p in data.get("profiles", [])]
         self.active_profile = data.get("active_profile", "")
+
+        ssh_data = data.get("ssh_tunnel", {})
+        self.ssh_tunnel = SshTunnelSettings(
+            host=ssh_data.get("host", ""),
+            user=ssh_data.get("user", "root") or "root",
+            port=int(ssh_data.get("port", 22) or 22),
+            password=ssh_data.get("password", ""),
+            key_path=ssh_data.get("key_path", ""),
+        )
 
         if data.get("config_version", 1) < CONFIG_VERSION:
             self._migrate(data.get("config_version", 1))
@@ -180,6 +191,15 @@ class ConfigStore:
                         "do header) liga o túnel SSH SOCKS5 em 127.0.0.1:1080 — configure "
                         "no RustDesk: Settings → Network → Socks5."
                     )
+        if from_version < 16:
+            from proxy_manager.elements_proxy import elements_default_apps
+
+            existing = {a.id for a in self.apps}
+            for app in elements_default_apps():
+                if app.id not in existing:
+                    self.apps.append(app)
+        if from_version < 17:
+            pass  # ssh_tunnel default vazio — usuário configura em Configurações
 
     def touch_recent_app(self, app_id: str) -> None:
         recent = [aid for aid in self.recent_app_ids if aid != app_id]
@@ -210,6 +230,13 @@ class ConfigStore:
             "recent_app_ids": self.recent_app_ids,
             "profiles": [p.to_dict() for p in self.profiles],
             "active_profile": self.active_profile,
+            "ssh_tunnel": {
+                "host": self.ssh_tunnel.host,
+                "user": self.ssh_tunnel.user,
+                "port": self.ssh_tunnel.port,
+                "password": self.ssh_tunnel.password,
+                "key_path": self.ssh_tunnel.key_path,
+            },
         }
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)

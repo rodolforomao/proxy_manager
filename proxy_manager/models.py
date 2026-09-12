@@ -58,6 +58,20 @@ class ProxySettings:
 
 
 @dataclass
+class SshTunnelSettings:
+    """Credenciais do servidor SSH usado pelo túnel SOCKS5 (botão S5 / RustDesk).
+
+    Próprias do proxy_generic — não dependem de nenhum outro projeto.
+    """
+
+    host: str = ""
+    user: str = "root"
+    port: int = 22
+    password: str = ""
+    key_path: str = ""
+
+
+@dataclass
 class AppRule:
     id: str
     name: str

@@ -274,6 +274,50 @@ def test_sync_persistent_applies_claude_when_proxy_on(tmp_path, monkeypatch):
     assert "7890" in settings.read_text(encoding="utf-8")
 
 
+def test_claude_proxy_syncs_alternate_config_dirs(tmp_path, monkeypatch):
+    """Wrappers com CLAUDE_CONFIG_DIR (~/.claude-conta*) também recebem proxy."""
+    from proxy_manager import claude_proxy
+    from proxy_manager.models import ProxySettings
+
+    default_dir = tmp_path / ".claude"
+    default_dir.mkdir()
+    default_settings = default_dir / "settings.json"
+    default_settings.write_text("{}\n", encoding="utf-8")
+
+    alt_dir = tmp_path / ".claude-conta1"
+    alt_dir.mkdir()
+    alt_settings = alt_dir / "settings.json"
+    alt_settings.write_text('{"theme":"light"}\n', encoding="utf-8")
+
+    monkeypatch.setattr(claude_proxy, "CLAUDE_SETTINGS", default_settings)
+
+    paths = claude_proxy.list_claude_settings_paths()
+    assert default_settings in paths
+    assert alt_settings in paths
+
+    proxy = ProxySettings(enabled=True, source="tor", upstream_host="127.0.0.1", upstream_port=9050)
+    claude_proxy.prepare_claude_proxy(proxy, use_proxy=True)
+
+    assert claude_proxy.claude_settings_proxy_active() is True
+    assert "7890" in default_settings.read_text(encoding="utf-8")
+    assert "7890" in alt_settings.read_text(encoding="utf-8")
+    assert "light" in alt_settings.read_text(encoding="utf-8")
+
+    claude_proxy.prepare_claude_proxy(proxy, use_proxy=False)
+    assert claude_proxy.claude_settings_proxy_active() is False
+    assert "7890" not in default_settings.read_text(encoding="utf-8")
+    assert "7890" not in alt_settings.read_text(encoding="utf-8")
+    assert "light" in alt_settings.read_text(encoding="utf-8")
+
+
+def test_is_claude_process_recognizes_wrappers():
+    from proxy_manager.claude_proxy import _is_claude_process
+
+    assert _is_claude_process("claude", "claude")
+    assert _is_claude_process("claude-dseclabs", "/home/x/.local/bin/claude-dseclabs")
+    assert not _is_claude_process("firefox", "firefox")
+
+
 def test_app_rule_use_socks5_default_false():
     app = AppRule(id="rustdesk", name="RustDesk", patterns=["rustdesk"])
     assert app.use_socks5 is False

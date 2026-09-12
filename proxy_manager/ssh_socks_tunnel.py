@@ -1,13 +1,12 @@
-"""Túnel SOCKS5 via SSH (-D) — equivalente a tunnel-socks5-ssh.sh do scm_vps_dici.
+"""Túnel SOCKS5 via SSH (-D) — só para apps que apontam manualmente (ex.: RustDesk → Socks5).
 
-Abre um proxy SOCKS5 local (padrão 127.0.0.1:1080) através de SSH até o VPS.
+Abre um proxy SOCKS5 local (padrão 127.0.0.1:1080) através de SSH até um servidor
+configurado pelo próprio usuário (Configurações → Túnel SSH SOCKS5), sem nenhuma
+dependência de outro projeto.
 
 IMPORTANTE — isolamento total do Tor / gost:
-- Este túnel é só para apps que apontam manualmente (ex.: RustDesk → Socks5).
 - NÃO é upstream do proxy local (:7890) e NÃO substitui Tor (:9050/:9051).
 - Ligar/desligar aqui não deve alterar source, verificação nem modo Tor/Rápido.
-
-Credenciais vêm do .env do projeto SCM.
 """
 
 from __future__ import annotations
@@ -21,13 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from proxy_manager.local_proxy import is_port_open
+from proxy_manager.models import SshTunnelSettings
 import proxy_manager.service_status as svc
 
 CONFIG_DIR = Path.home() / ".config" / "proxy-manager"
 PID_FILE = CONFIG_DIR / "ssh-socks-tunnel.pid"
 LOG_FILE = CONFIG_DIR / "ssh-socks-tunnel.log"
 
-DEFAULT_ENV_FILE = Path("/home/black/enviroment/config/scm_vps_dici/.env")
 DEFAULT_LOCAL_PORT = 1080
 SVC_ID = "ssh_socks"
 
@@ -43,7 +42,6 @@ class SshTunnelConfig:
     password: str = field(default="", repr=False)
     key_path: str = ""
     local_port: int = DEFAULT_LOCAL_PORT
-    env_file: Path = DEFAULT_ENV_FILE
 
 
 def _read_pid() -> int | None:
@@ -68,36 +66,24 @@ def _clear_pid() -> None:
 
 
 def load_ssh_config(
-    env_file: Path | None = None,
+    settings: SshTunnelSettings,
     local_port: int = DEFAULT_LOCAL_PORT,
 ) -> SshTunnelConfig:
-    """Carrega SSH_* do .env (mesmo formato de scm_vps_dici/_lib.sh)."""
-    path = env_file or DEFAULT_ENV_FILE
-    if not path.is_file():
-        raise FileNotFoundError(f"Arquivo .env não encontrado: {path}")
-
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        if key:
-            values[key] = val.strip().strip('"').strip("'")
-
-    host = values.get("SSH_HOST", "").strip()
+    """Monta a config do túnel a partir das credenciais salvas em Configurações."""
+    host = (settings.host or "").strip()
     if not host:
-        raise ValueError(f"Defina SSH_HOST em {path}")
+        raise ValueError(
+            "Configure o host/usuário/senha do túnel SSH em "
+            "Configurações → Túnel SSH SOCKS5."
+        )
 
     return SshTunnelConfig(
         host=host,
-        user=values.get("SSH_USER", "root").strip() or "root",
-        port=int(values.get("SSH_PORT", "22") or "22"),
-        password=values.get("SSH_PASSWORD", ""),
-        key_path=values.get("SSH_KEY_PATH", "").strip(),
+        user=(settings.user or "root").strip() or "root",
+        port=settings.port or 22,
+        password=settings.password,
+        key_path=(settings.key_path or "").strip(),
         local_port=local_port,
-        env_file=path,
     )
 
 
@@ -178,7 +164,7 @@ def _build_ssh_cmd(cfg: SshTunnelConfig) -> list[str]:
 
 
 def start_tunnel(
-    env_file: Path | None = None,
+    settings: SshTunnelSettings,
     local_port: int = DEFAULT_LOCAL_PORT,
 ) -> tuple[bool, str]:
     """Inicia o túnel SOCKS5 em background. Retorna (ok, mensagem)."""
@@ -194,8 +180,8 @@ def start_tunnel(
         return False, msg
 
     try:
-        cfg = load_ssh_config(env_file=env_file, local_port=local_port)
-    except (FileNotFoundError, ValueError, OSError) as exc:
+        cfg = load_ssh_config(settings, local_port=local_port)
+    except ValueError as exc:
         msg = str(exc)
         svc.update(SVC_ID, "erro", msg)
         return False, msg
@@ -295,12 +281,12 @@ def stop_tunnel(local_port: int = DEFAULT_LOCAL_PORT) -> tuple[bool, str]:
 
 
 def toggle_tunnel(
-    env_file: Path | None = None,
+    settings: SshTunnelSettings,
     local_port: int = DEFAULT_LOCAL_PORT,
 ) -> tuple[bool, str]:
     """Liga se estiver off; desliga se estiver on. Retorna (habilitado, mensagem)."""
     if is_running(local_port):
         stop_tunnel(local_port)
         return False, "Desabilitado"
-    ok, msg = start_tunnel(env_file=env_file, local_port=local_port)
+    ok, msg = start_tunnel(settings, local_port=local_port)
     return ok, msg

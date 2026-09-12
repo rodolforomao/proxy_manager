@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +46,71 @@ def _exec_basename(cmdline: list[str], fallback_name: str) -> str:
                 if not part.startswith("-") and "=" not in part:
                     token = part
                     break
-        return Path(token).name
+        return _resolve_exec_basename(token)
     return fallback_name
+
+
+_SNAP_WRAPPERS = frozenset({"snap", "snap-confine", "flatpak", "flatpak-bwrap"})
+
+
+def _resolve_exec_basename(token: str) -> str:
+    path = Path(token)
+    logical = path.name
+    if path.is_file() or path.is_symlink():
+        try:
+            resolved_name = path.resolve().name
+            if resolved_name not in _SNAP_WRAPPERS:
+                return resolved_name
+        except OSError:
+            pass
+    return logical
+
+
+def _exec_aliases(base: str) -> set[str]:
+    if not base:
+        return set()
+    aliases = {base}
+    if base.endswith("-bin"):
+        aliases.add(base[:-4])
+    else:
+        aliases.add(f"{base}-bin")
+    return aliases
+
+
+def _desktop_app_dirs() -> list[Path]:
+    dirs = [
+        Path("/usr/share/applications"),
+        Path("/usr/local/share/applications"),
+        Path.home() / ".local/share/applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+        Path.home() / ".local/share/flatpak/exports/share/applications",
+        Path("/var/lib/snapd/desktop/applications"),
+    ]
+    for part in os.environ.get("XDG_DATA_DIRS", "").split(":"):
+        if part:
+            dirs.append(Path(part) / "applications")
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
+
+
+def patterns_for_installed_app(app: InstalledApp) -> list[str]:
+    """Gera patterns a partir dos executáveis do .desktop (inclui variantes -bin)."""
+    patterns: list[str] = []
+    seen: set[str] = set()
+    for token in app.command.split():
+        if "=" in token or token.startswith("-"):
+            continue
+        base = _resolve_exec_basename(token).lower()
+        for alias in sorted(_exec_aliases(base)):
+            if alias not in seen:
+                seen.add(alias)
+                patterns.append(alias)
+    return patterns
 
 
 def _is_noise_process(name: str, cmdline: str, cmdline_list: list[str]) -> bool:
@@ -81,16 +145,9 @@ def is_already_configured(candidate: InstalledApp, apps: list[AppRule]) -> bool:
 
 def scan_installed_apps() -> list[InstalledApp]:
     """Lê arquivos .desktop e retorna apps instalados, ordenados por nome."""
-    dirs = [
-        Path("/usr/share/applications"),
-        Path("/usr/local/share/applications"),
-        Path.home() / ".local/share/applications",
-        Path("/var/lib/flatpak/exports/share/applications"),
-        Path.home() / ".local/share/flatpak/exports/share/applications",
-    ]
     seen: dict[str, InstalledApp] = {}
     cp = configparser.RawConfigParser()
-    for d in dirs:
+    for d in _desktop_app_dirs():
         if not d.is_dir():
             continue
         for f in d.glob("*.desktop"):
@@ -123,13 +180,12 @@ def scan_installed_apps() -> list[InstalledApp]:
 def _index_installed_by_exec(apps: list[InstalledApp]) -> dict[str, InstalledApp]:
     index: dict[str, InstalledApp] = {}
     for app in apps:
-        base = _exec_basename(app.command.split(), app.command)
-        if base and base not in index:
-            index[base] = app
+        keys: set[str] = set()
         for token in app.command.split():
             if "=" in token or token.startswith("-"):
                 continue
-            key = Path(token).name
+            keys.update(_exec_aliases(_resolve_exec_basename(token)))
+        for key in keys:
             if key and key not in index:
                 index[key] = app
     return index

@@ -4,6 +4,7 @@ import psutil
 
 from proxy_manager.browser_proxy import browser_proxy_active, is_browser_app, is_content_process, is_main_browser_process
 from proxy_manager.claude_proxy import claude_proxy_active
+from proxy_manager.elements_proxy import elements_process_status, is_elements_app
 from proxy_manager.models import AppRule, ProcessInfo, ProxySettings
 from proxy_manager.network import detect_process_interface
 from proxy_manager.proxy_env import classify_process_status, read_process_proxy_env
@@ -58,9 +59,12 @@ def scan_processes(
             )
             if special_active is None:
                 special_active = browser_proxy_active(matched, cmdline)
+            elements_status_text: str | None = None
+            if special_active is None and is_elements_app(matched):
+                special_active, elements_status_text = elements_process_status(matched)
             if special_active is not None:
                 active = special_active
-                status = "proxy ativo ✓" if active else "sem proxy"
+                status = elements_status_text or ("proxy ativo ✓" if active else "sem proxy")
             else:
                 active, status = classify_process_status(matched, proxy_env, proxy)
             iface = None

@@ -16,8 +16,8 @@ except Exception:
 
 
 _MODE_LABELS = {
-    "tor": "🧅 Tor",
-    "fast": "⚡ Rápido",
+    "tor": "Tor",
+    "fast": "Rapido",
     "local": "proxy local",
 }
 
@@ -83,10 +83,10 @@ class ProxyTray:
     def _title(self) -> str:
         ver = app_version()
         if not self._proxy_on():
-            return f"Proxy Manager {ver} — desligado"
+            return f"Proxy Manager {ver} - desligado"
         mode_label = _MODE_LABELS.get(self._mode, "ativo")
         status_label = _STATUS_LABELS.get(self._status, "")
-        return f"Proxy Manager {ver} — {mode_label} ({status_label})"
+        return f"Proxy Manager {ver} - {mode_label} ({status_label})"
 
     def _build_menu(self) -> "pystray.Menu":
         label_toggle = "Desligar proxy" if self._proxy_on() else "Ligar proxy"

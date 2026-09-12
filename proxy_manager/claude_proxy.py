@@ -12,7 +12,7 @@ ANTHROPIC_API_HOST = "api.anthropic.com"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 CLAUDE_APP_ID = "claude"
 
-# Chaves que o Proxy Manager grava em ~/.claude/settings.json (env).
+# Chaves que o Proxy Manager grava em settings.json (env).
 _MANAGED_ENV_KEYS = frozenset(
     {
         "HTTP_PROXY",
@@ -32,20 +32,49 @@ def is_claude_app(app: AppRule) -> bool:
     return app.id == CLAUDE_APP_ID
 
 
-def _load_settings() -> dict:
-    if not CLAUDE_SETTINGS.is_file():
+def list_claude_settings_paths() -> list[Path]:
+    """Todos os settings.json do Claude Code que o Proxy Manager sincroniza.
+
+    Inclui o default (~/.claude) e contas alternativas (~/.claude-conta*),
+    usadas por wrappers como claude-dseclabs (CLAUDE_CONFIG_DIR).
+    Em testes, monkeypatch de CLAUDE_SETTINGS isola a descoberta ao tmp.
+    """
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+
+    add(CLAUDE_SETTINGS)
+
+    # Contas extras ao lado do diretório default (ex.: ~/.claude-conta1).
+    home = CLAUDE_SETTINGS.parent.parent
+    for directory in sorted(home.glob(".claude-conta*")):
+        if directory.is_dir():
+            add(directory / "settings.json")
+
+    return paths
+
+
+def _load_settings(path: Path | None = None) -> dict:
+    target = path or CLAUDE_SETTINGS
+    if not target.is_file():
         return {}
     try:
-        with open(CLAUDE_SETTINGS, encoding="utf-8") as f:
+        with open(target, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _save_settings(data: dict) -> None:
-    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-    with open(CLAUDE_SETTINGS, "w", encoding="utf-8") as f:
+def _save_settings(data: dict, path: Path | None = None) -> None:
+    target = path or CLAUDE_SETTINGS
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
@@ -61,14 +90,12 @@ def _local_proxy_tcp_hex() -> tuple[str, str]:
 
 def _is_claude_process(name: str, cmdline: str) -> bool:
     base = name.lower()
-    if base in ("claude", "claude-code"):
+    if base in ("claude", "claude-code") or base.startswith("claude-"):
         return True
     parts = cmdline.split()
     if parts:
-        from pathlib import Path
-
         exe = Path(parts[0]).name.lower()
-        if exe in ("claude", "claude-code"):
+        if exe in ("claude", "claude-code") or exe.startswith("claude-"):
             return True
     return False
 
@@ -100,7 +127,7 @@ def claude_session_stats() -> tuple[int, int]:
 
 
 def ensure_claude_settings(proxy: ProxySettings, use_proxy: bool) -> bool:
-    """Grava settings.json e confirma que a seção env ficou correta."""
+    """Grava settings.json (todas as contas) e confirma a seção env."""
     prepare_claude_proxy(proxy, use_proxy)
     if use_proxy:
         return claude_settings_proxy_active()
@@ -130,9 +157,8 @@ def process_uses_local_proxy(pid: int) -> bool:
     return False
 
 
-def claude_settings_proxy_active() -> bool:
-    """True se settings.json aponta para o proxy local do Proxy Manager."""
-    env = _load_settings().get("env")
+def _settings_path_proxy_active(path: Path) -> bool:
+    env = _load_settings(path).get("env")
     if not isinstance(env, dict):
         return False
     needle = _local_proxy_url()
@@ -143,9 +169,30 @@ def claude_settings_proxy_active() -> bool:
     return False
 
 
+def claude_settings_proxy_active() -> bool:
+    """True se todos os settings Claude sincronizados apontam para o proxy local."""
+    paths = list_claude_settings_paths()
+    # Primary sempre conta; contas alternativas só se o diretório já existir.
+    checked = False
+    for path in paths:
+        if path == CLAUDE_SETTINGS or path.parent.is_dir():
+            checked = True
+            if not _settings_path_proxy_active(path):
+                return False
+    return checked
+
+
 def prepare_claude_proxy(proxy: ProxySettings, use_proxy: bool) -> None:
-    """Persiste variáveis de proxy em ~/.claude/settings.json (oficial Claude Code)."""
-    data = _load_settings()
+    """Persiste variáveis de proxy em todos os settings.json do Claude Code."""
+    for path in list_claude_settings_paths():
+        # Não cria contas novas: só grava se o dir default ou a conta já existir.
+        if path != CLAUDE_SETTINGS and not path.parent.is_dir():
+            continue
+        _prepare_claude_proxy_at(path, proxy, use_proxy)
+
+
+def _prepare_claude_proxy_at(path: Path, proxy: ProxySettings, use_proxy: bool) -> None:
+    data = _load_settings(path)
     env = data.get("env")
     if not isinstance(env, dict):
         env = {}
@@ -164,7 +211,7 @@ def prepare_claude_proxy(proxy: ProxySettings, use_proxy: bool) -> None:
     elif "env" in data:
         del data["env"]
 
-    _save_settings(data)
+    _save_settings(data, path)
 
 
 def claude_proxy_reachable(timeout: float = 8.0) -> tuple[bool, str]:

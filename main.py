@@ -91,9 +91,9 @@ def _read_lock_pid() -> int | None:
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return None
-    if b"main.py" not in cmdline:
-        return None  # PID reaproveitado por outro processo
-    return pid
+    if b"main.py" in cmdline or b"proxy-manager" in cmdline:
+        return pid
+    return None
 
 
 def _focus_existing_instance() -> bool:
