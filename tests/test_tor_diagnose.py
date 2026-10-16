@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from proxy_manager.models import ProxySettings
 from proxy_manager.proxy_health import activation_failure_detail
 from proxy_manager.tor_country import diagnose_tor_log
@@ -226,3 +228,110 @@ def test_activation_failure_keeps_non_tor_message():
     proxy = ProxySettings(source="free", upstream_host="1.2.3.4", upstream_port=8080)
     fallback = "Proxy local ligado, mas o tráfego não passou."
     assert activation_failure_detail(proxy, fallback) == fallback
+
+
+def _iso(when: datetime) -> str:
+    return when.astimezone().isoformat(timespec="seconds")
+
+
+def test_old_timeout_after_bootstrap_does_not_block():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=6))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now - timedelta(minutes=50))} host Tor[1]: "
+        "Tried for 1799 seconds to get a connection to [scrubbed]:80. Giving up.\n"
+        f"{_iso(now)} host Tor[1]: Failed to find node for hop #1 of our path. Discarding this circuit.\n"
+    )
+    assert diagnose_tor_log(log, version="0.4.9.11", now=now) == ""
+
+
+def test_recent_timeout_after_bootstrap_still_blocks():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=1))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now - timedelta(seconds=30))} host Tor[1]: "
+        "Tried for 1799 seconds to get a connection to [scrubbed]:80. Giving up.\n"
+    )
+    msg = diagnose_tor_log(log, version="0.4.9.11", now=now)
+    assert "1799" in msg
+    assert "circuitos não fecham" in msg
+
+
+def test_path_restriction_explains_only_failed_traffic():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=1))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now)} host Tor[1]: All current guards excluded by path restriction type 2; "
+        "using an additional guard.\n"
+        f"{_iso(now)} host Tor[1]: Failed to find node for hop #1 of our path. Discarding this circuit.\n"
+    )
+    assert diagnose_tor_log(log, now=now) == ""
+    msg = diagnose_tor_log(log, version="0.4.9.11", traffic_failed=True, now=now)
+    assert "hop 1" in msg
+    assert "path restriction type 2" in msg
+
+
+def test_old_path_restriction_is_ignored_even_if_traffic_failed():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=2))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now - timedelta(minutes=40))} host Tor[1]: "
+        "All current guards excluded by path restriction type 0; using an additional guard.\n"
+        f"{_iso(now - timedelta(minutes=40))} host Tor[1]: "
+        "Failed to find node for hop #1 of our path. Discarding this circuit.\n"
+    )
+    assert diagnose_tor_log(log, traffic_failed=True, now=now) == ""
+
+
+def test_circuit_block_clears_when_socks_connects(monkeypatch):
+    from proxy_manager.proxy_sources import tor_circuit_block
+
+    monkeypatch.setattr("proxy_manager.proxy_sources.is_port_open", lambda host, port: True)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.tor_failure_hint",
+        lambda port, traffic_failed=False, force=False: (
+            "Tor 0.4.9.11 escuta, mas os circuitos não fecham (1799s)."
+        ),
+    )
+    monkeypatch.setattr("proxy_manager.tor_country.socks_circuit_open", lambda port, timeout=2.5: True)
+    noted: list[int] = []
+    monkeypatch.setattr("proxy_manager.tor_country.note_live_circuit", lambda port: noted.append(port))
+    assert tor_circuit_block(9050) == ""
+    assert noted == [9050]
+
+
+def test_circuit_block_keeps_stuck_bootstrap(monkeypatch):
+    from proxy_manager.proxy_sources import tor_circuit_block
+
+    monkeypatch.setattr("proxy_manager.proxy_sources.is_port_open", lambda host, port: True)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.tor_failure_hint",
+        lambda port, traffic_failed=False, force=False: (
+            "Tor 0.4.9.11 está preso no bootstrap 14% (handshake)."
+        ),
+    )
+
+    def boom(port, timeout=2.5):
+        raise AssertionError("bootstrap preso não deve abrir circuito de prova")
+
+    monkeypatch.setattr("proxy_manager.tor_country.socks_circuit_open", boom)
+    msg = tor_circuit_block(9050)
+    assert "14%" in msg
+
+
+def test_live_circuit_hides_soft_hint_until_traffic_fails(monkeypatch):
+    from proxy_manager.tor_country import clear_tor_hint_cache, note_live_circuit, tor_failure_hint
+
+    clear_tor_hint_cache()
+    monkeypatch.setattr(
+        "proxy_manager.tor_country._recent_tor_log",
+        lambda port: "Tried for 90 seconds to get a connection to [scrubbed]:443. Giving up.\n",
+    )
+    monkeypatch.setattr("proxy_manager.tor_country._tor_version", lambda: "0.4.9.11")
+    blocked = tor_failure_hint(9050, force=True)
+    assert "90" in blocked
+    note_live_circuit(9050)
+    assert tor_failure_hint(9050, force=True) == ""
+    failed = tor_failure_hint(9050, traffic_failed=True, force=True)
+    assert "90" in failed
+    clear_tor_hint_cache()

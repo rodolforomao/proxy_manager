@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from proxy_manager.local_proxy import is_port_open
@@ -40,8 +42,20 @@ _BIND_RE = re.compile(
     r"((?:Could not bind to|Failed to bind|Address already in use).+)",
     re.IGNORECASE,
 )
+_HOP_RE = re.compile(r"Failed to find node for hop #(\d+)")
+_RESTRICT_RE = re.compile(r"path restriction type (\d+)")
+_LOG_TS_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)\s+"
+)
 _HINT_TTL = 30.0
+_LIVE_OK_TTL = 45.0
+_PROBE_TTL = 20.0
+# Reclamação de circuito depois do bootstrap. Mais velha que isso não bloqueia:
+# o journal guarda o timeout, mas um circuito novo pode já ter fechado.
+_CIRCUIT_EVENT_MAX_AGE = timedelta(minutes=10)
 _hint_cache: dict[tuple[int, bool], tuple[float, str]] = {}
+_live_ok: dict[int, float] = {}
+_probe_cache: dict[int, tuple[float, bool]] = {}
 _version_cache: str | None = None
 
 
@@ -64,6 +78,45 @@ def _tor_version() -> str:
     return _version_cache
 
 
+def _journal_text(extra: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", "tor@default", "--no-pager", "-o", "short-iso", *extra],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    lines = [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.startswith("-- ")
+    ]
+    return "\n".join(lines)
+
+
+def _sorted_log(text: str) -> str:
+    """Junta trechos do journal em ordem cronológica, sem linha repetida."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+
+    def _key(line: str) -> str:
+        match = _LOG_TS_RE.match(line)
+        return match.group("ts") if match else ""
+
+    lines.sort(key=_key)
+    return "\n".join(lines)
+
+
 def _recent_tor_log(port: int) -> str:
     parts: list[str] = []
     if port == MANAGED_TOR_PORT and TOR_LOG_FILE.exists():
@@ -72,19 +125,36 @@ def _recent_tor_log(port: int) -> str:
         except OSError:
             pass
     if port == DEFAULT_SYSTEM_TOR_PORT:
-        try:
-            result = subprocess.run(
-                ["journalctl", "-u", "tor@default", "-n", "120", "--no-pager", "-o", "cat"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=False,
+        # Um "-n 120" mistura timeout velho com o flood de hop #1 e ainda
+        # perde o "Bootstrapped 100%". Os últimos marcos vêm numa consulta;
+        # a janela de 10 min é o que ainda pode ser falha viva.
+        parts.append(
+            _journal_text(
+                [
+                    "-n",
+                    "8",
+                    "-g",
+                    "Opening Socks listener on 127.0.0.1:|Bootstrapped 100%"
+                    "|Could not bind|The missing protocols are|Stuck at ",
+                ]
             )
-            if result.returncode == 0 and result.stdout.strip():
-                parts.append(result.stdout)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    return "\n".join(parts)
+        )
+        parts.append(_journal_text(["--since", "-10min"]))
+    return _sorted_log("\n".join(parts))
+
+
+def _circuit_line_is_fresh(line: str, now: datetime) -> bool:
+    """Linha sem horário conta (testes e log da instância). Com horário, só os últimos 10 min."""
+    match = _LOG_TS_RE.match(line)
+    if not match:
+        return True
+    try:
+        seen = datetime.fromisoformat(match.group("ts").replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=now.tzinfo)
+    return now - seen <= _CIRCUIT_EVENT_MAX_AGE
 
 
 def _current_session(text: str) -> str:
@@ -97,12 +167,19 @@ def _current_session(text: str) -> str:
     return "\n".join(lines[start:])
 
 
-def diagnose_tor_log(text: str, *, version: str = "", traffic_failed: bool = False) -> str:
+def diagnose_tor_log(
+    text: str,
+    *,
+    version: str = "",
+    traffic_failed: bool = False,
+    now: datetime | None = None,
+) -> str:
     """Explica a falha real do Tor a partir do log. Vazio se não houver causa acionável."""
     text = _current_session(text)
     if not text or not text.strip():
         return ""
 
+    clock = now or datetime.now().astimezone()
     missing = ""
     stuck: tuple[str, str] | None = None
     stuck_at = -1
@@ -119,7 +196,12 @@ def diagnose_tor_log(text: str, *, version: str = "", traffic_failed: bool = Fal
     reset_reason = ""
     reset_count = ""
     reset_at = -1
+    hop_n = ""
+    hop_at = -1
+    restrict_type = ""
+    restrict_at = -1
     for idx, line in enumerate(text.splitlines()):
+        fresh = _circuit_line_is_fresh(line, clock)
         match = _MISSING_PROTO_RE.search(line)
         if match:
             missing = match.group(1).strip().rstrip(".")
@@ -130,21 +212,29 @@ def diagnose_tor_log(text: str, *, version: str = "", traffic_failed: bool = Fal
         if "Bootstrapped 100%" in line:
             done_at = idx
         match = _TIMEOUT_RE.search(line)
-        if match:
+        if match and fresh:
             timeout_s = match.group(1)
             timeout_at = idx
         match = _GUARD_RE.search(line)
-        if match:
+        if match and fresh:
             guard_fail = True
             guard_at = idx
             guard_name = match.group(1)
             guard_counts = f"{match.group(2)}/{match.group(3)}"
-        elif "failing an extremely large amount of circuits" in line:
+        elif fresh and "failing an extremely large amount of circuits" in line:
             guard_fail = True
             guard_at = idx
-        if "timed out anyway" in line or "No circuits are opened" in line:
+        if fresh and ("timed out anyway" in line or "No circuits are opened" in line):
             soft_timeout = True
             soft_at = idx
+        match = _HOP_RE.search(line)
+        if match and fresh:
+            hop_n = match.group(1)
+            hop_at = idx
+        match = _RESTRICT_RE.search(line)
+        if match and fresh:
+            restrict_type = match.group(1)
+            restrict_at = idx
         match = _RESET_RE.search(line)
         if match:
             reset_reason = match.group(1).upper()
@@ -166,11 +256,16 @@ def diagnose_tor_log(text: str, *, version: str = "", traffic_failed: bool = Fal
     timeout_current = bool(timeout_s) and _still_current(timeout_at)
     reset_current = bool(reset_reason) and _still_current(reset_at)
     soft_current = soft_timeout and _still_current(soft_at)
+    hop_current = bool(hop_n) and _still_current(hop_at)
+    restrict_current = bool(restrict_type) and _still_current(restrict_at)
+    route_discarded = traffic_failed and (hop_current or restrict_current)
     circuits_bad = bool(
         guard_current or timeout_current or reset_current or (traffic_failed and soft_current)
     )
     stuck_current = stuck is not None and _still_current(stuck_at)
-    broken = bool(bind_error or circuits_bad or stuck_current or (traffic_failed and missing))
+    broken = bool(
+        bind_error or circuits_bad or stuck_current or (traffic_failed and missing) or route_discarded
+    )
     if not broken:
         return ""
 
@@ -207,13 +302,73 @@ def diagnose_tor_log(text: str, *, version: str = "", traffic_failed: bool = Fal
         why = f"O guard {guard_name} só completou {guard_counts} circuitos."
     elif guard_current or timeout_current:
         why = "Os guards falham ou as conexões expiram antes de sair para a internet."
+    elif hop_current or restrict_current:
+        where = f"no hop {hop_n}" if hop_current else "na rota"
+        kind = f", path restriction type {restrict_type}" if restrict_current else ""
+        why = f"O Tor descarta o circuito {where}{kind}."
     else:
         why = "Nenhum circuito ficou aberto para sair à internet."
     return f"Tor{ver} escuta, mas os circuitos não fecham{waited}. {why}"
 
 
+def circuit_hint_can_recover(hint: str) -> bool:
+    """Falha de circuito depois do bootstrap. Um SOCKS novo pode mostrar que já passou."""
+    return "circuitos não fecham" in hint
+
+
+def _live_circuit_recent(port: int) -> bool:
+    seen = _live_ok.get(port)
+    return seen is not None and time.monotonic() - seen < _LIVE_OK_TTL
+
+
+def note_live_circuit(port: int) -> None:
+    """Circuito SOCKS acabou de fechar. O log velho deixa de bloquear por um instante."""
+    _live_ok[port] = time.monotonic()
+    _hint_cache.pop((port, False), None)
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def socks_circuit_open(port: int, timeout: float = 2.5) -> bool:
+    """Abre um circuito SOCKS novo. Verdadeiro se o Tor aceitar o CONNECT."""
+    cached = _probe_cache.get(port)
+    now = time.monotonic()
+    if cached and now - cached[0] < _PROBE_TTL:
+        return cached[1]
+    ok = False
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exact(sock, 2) != b"\x05\x00":
+            ok = False
+        else:
+            host = b"example.com"
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + (80).to_bytes(2, "big"))
+            reply = _recv_exact(sock, 4)
+            ok = len(reply) >= 2 and reply[0] == 5 and reply[1] == 0
+    except OSError:
+        ok = False
+    finally:
+        if sock is not None:
+            sock.close()
+    _probe_cache[port] = (time.monotonic(), ok)
+    return ok
+
+
 def tor_failure_hint(port: int, *, traffic_failed: bool = False, force: bool = False) -> str:
     """Causa curta lida do journal (Tor do sistema) ou do log da instância gerenciada."""
+    if not traffic_failed and _live_circuit_recent(port):
+        return ""
     key = (port, traffic_failed)
     now = time.monotonic()
     cached = _hint_cache.get(key)
@@ -230,6 +385,8 @@ def tor_failure_hint(port: int, *, traffic_failed: bool = False, force: bool = F
 
 def clear_tor_hint_cache() -> None:
     _hint_cache.clear()
+    _live_ok.clear()
+    _probe_cache.clear()
 
 
 def _read_pid() -> int | None:

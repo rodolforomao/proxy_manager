@@ -499,16 +499,26 @@ def tor_status(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
 
 
 def tor_circuit_block(port: int = DEFAULT_TOR_PORT) -> str:
-    """Motivo para não tratar a porta SOCKS como circuito pronto. Vazio se o log não acusa falha.
+    """Motivo para não tratar a porta SOCKS como circuito pronto. Vazio se o Tor sai.
 
     Porta fechada não consulta o journal: o aviso de instalação vem de tor_status.
-    Um bootstrap que já chegou a 100% também fica vazio.
+    Timeout e guard no journal só bloqueiam se ainda forem recentes e um CONNECT
+    SOCKS novo também falhar. Bootstrap preso, bind e protocolo continuam bloqueando.
     """
     if not is_port_open("127.0.0.1", port):
         return ""
-    from proxy_manager.tor_country import tor_failure_hint
+    from proxy_manager.tor_country import (
+        circuit_hint_can_recover,
+        note_live_circuit,
+        socks_circuit_open,
+        tor_failure_hint,
+    )
 
-    return tor_failure_hint(port)
+    hint = tor_failure_hint(port)
+    if hint and circuit_hint_can_recover(hint) and socks_circuit_open(port):
+        note_live_circuit(port)
+        return ""
+    return hint
 
 
 def try_start_tor(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
