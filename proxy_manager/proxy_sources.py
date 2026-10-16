@@ -509,6 +509,7 @@ def tor_circuit_block(port: int = DEFAULT_TOR_PORT) -> str:
         return ""
     from proxy_manager.tor_country import (
         circuit_hint_can_recover,
+        clock_jump_block,
         note_live_circuit,
         socks_circuit_open,
         tor_failure_hint,
@@ -518,7 +519,9 @@ def tor_circuit_block(port: int = DEFAULT_TOR_PORT) -> str:
     if hint and circuit_hint_can_recover(hint) and socks_circuit_open(port):
         note_live_circuit(port)
         return ""
-    return hint
+    if hint:
+        return hint
+    return clock_jump_block(port)
 
 
 def try_start_tor(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
@@ -568,10 +571,20 @@ def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
         ok, msg, port = ensure_tor_for_country(country)
         if not ok:
             return False, msg
+        fresh_msg = ""
         block = tor_circuit_block(port)
+        if block and "relógio avançou" in block and port == DEFAULT_TOR_PORT:
+            from proxy_manager.tor_country import adopt_fresh_tor_after_clock_jump
+
+            ok, fresh_msg, port = adopt_fresh_tor_after_clock_jump()
+            if not ok:
+                return False, fresh_msg
+            block = tor_circuit_block(port)
         if block:
             return False, block
         apply_tor(settings, port)
+        if fresh_msg:
+            return True, fresh_msg
         if country:
             return True, f"Tor {country.upper()} — socks5://127.0.0.1:{port}"
         return True, f"Tor — socks5://127.0.0.1:{port}"
@@ -581,6 +594,17 @@ def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
     if not ok:
         return False, msg
     block = tor_circuit_block(DEFAULT_TOR_PORT)
+    if block and "relógio avançou" in block:
+        from proxy_manager.tor_country import adopt_fresh_tor_after_clock_jump
+
+        ok, msg, port = adopt_fresh_tor_after_clock_jump()
+        if not ok:
+            return False, msg
+        block = tor_circuit_block(port)
+        if block:
+            return False, block
+        apply_tor(settings, port)
+        return True, msg
     if block:
         return False, block
     apply_tor(settings, DEFAULT_TOR_PORT)

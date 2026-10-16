@@ -319,6 +319,140 @@ def test_circuit_block_keeps_stuck_bootstrap(monkeypatch):
     assert "14%" in msg
 
 
+def test_clock_jump_explains_the_timeout_it_caused():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=2))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now - timedelta(seconds=20))} host Tor[1]: "
+        "Your system clock just jumped 641 seconds forward; "
+        "assuming established circuits no longer work.\n"
+        f"{_iso(now - timedelta(seconds=20))} host Tor[1]: "
+        "Tried for 641 seconds to get a connection to [scrubbed]:80. Giving up. "
+        "(waiting for circuit)\n"
+    )
+    msg = diagnose_tor_log(log, version="0.4.9.11", now=now)
+    assert "relógio avançou 641s" in msg
+    assert "circuitos não fecham" not in msg
+
+
+def test_old_clock_jump_is_not_a_live_log_failure():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=2))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now - timedelta(minutes=40))} host Tor[1]: "
+        "Your system clock just jumped 641 seconds forward; "
+        "assuming established circuits no longer work.\n"
+        f"{_iso(now - timedelta(minutes=40))} host Tor[1]: "
+        "Tried for 641 seconds to get a connection to [scrubbed]:80. Giving up.\n"
+    )
+    assert diagnose_tor_log(log, now=now) == ""
+
+
+def test_clock_jump_parser_keeps_recent_and_drops_old():
+    from proxy_manager.tor_country import clock_jump_seconds_from_log
+
+    now = datetime.now().astimezone()
+    recent = (
+        f"{_iso(now - timedelta(minutes=30))} host Tor[1]: "
+        "Your system clock just jumped 641 seconds forward; "
+        "assuming established circuits no longer work.\n"
+    )
+    old = (
+        f"{_iso(now - timedelta(hours=5))} host Tor[1]: "
+        "Your system clock just jumped 99 seconds forward; "
+        "assuming established circuits no longer work.\n"
+    )
+    assert clock_jump_seconds_from_log(recent, now=now) == 641
+    assert clock_jump_seconds_from_log(old, now=now) == 0
+    assert clock_jump_seconds_from_log(old + recent, now=now) == 641
+
+
+def test_circuit_block_uses_clock_jump_after_log_window(monkeypatch):
+    from proxy_manager.proxy_sources import tor_circuit_block
+
+    monkeypatch.setattr("proxy_manager.proxy_sources.is_port_open", lambda host, port: True)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.tor_failure_hint",
+        lambda port, traffic_failed=False, force=False: "",
+    )
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.clock_jump_block",
+        lambda port: "Tor descartou os circuitos: o relógio avançou 641s",
+    )
+    msg = tor_circuit_block(9050)
+    assert "relógio avançou" in msg
+
+
+def test_auto_configure_replaces_tor_after_clock_jump(monkeypatch):
+    from proxy_manager.proxy_sources import _auto_configure_tor
+
+    monkeypatch.setattr("proxy_manager.tor_country.TOR_EXIT_COUNTRY_ENABLED", True)
+    monkeypatch.setattr(
+        "proxy_manager.proxy_sources.ensure_tor_for_country",
+        lambda country="": (True, "sistema", 9050),
+    )
+    monkeypatch.setattr(
+        "proxy_manager.proxy_sources.tor_circuit_block",
+        lambda port=9050: (
+            ""
+            if port == 9051
+            else "Tor descartou os circuitos: o relógio avançou 641s (suspensão ou ajuste do relógio)."
+        ),
+    )
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.adopt_fresh_tor_after_clock_jump",
+        lambda: (True, "Tor novo em 127.0.0.1:9051", 9051),
+    )
+    proxy = ProxySettings(source="direct", auto_proxy_mode="tor")
+    ok, msg = _auto_configure_tor(proxy)
+    assert ok is True
+    assert proxy.source == "tor"
+    assert proxy.upstream_port == 9051
+    assert "9051" in msg
+
+
+def test_adopt_reuses_managed_tor_and_reports_when_circuit_stays_down(monkeypatch):
+    from proxy_manager.tor_country import adopt_fresh_tor_after_clock_jump
+
+    monkeypatch.setattr("proxy_manager.tor_country.is_port_open", lambda host, port: True)
+    monkeypatch.setattr("proxy_manager.tor_country._read_pid", lambda: 123)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.start_managed_tor",
+        lambda country="": (_ for _ in ()).throw(AssertionError("não deveria reiniciar")),
+    )
+    monkeypatch.setattr("proxy_manager.tor_country.wait_for_socks_circuit", lambda port, timeout=45: False)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.tor_failure_hint",
+        lambda port, traffic_failed=False, force=False: "preso no bootstrap 14% (handshake): CONNECTRESET",
+    )
+    ok, msg, port = adopt_fresh_tor_after_clock_jump()
+    assert ok is False
+    assert port == 9051
+    assert "CONNECTRESET" in msg
+    assert "relógio avançou" in msg
+
+
+def test_adopt_starts_managed_tor_and_switches_port(monkeypatch):
+    from proxy_manager.tor_country import adopt_fresh_tor_after_clock_jump
+
+    monkeypatch.setattr("proxy_manager.tor_country.is_port_open", lambda host, port: False)
+    monkeypatch.setattr("proxy_manager.tor_country._read_pid", lambda: None)
+    monkeypatch.setattr("proxy_manager.tor_country.stop_managed_tor", lambda: None)
+    monkeypatch.setattr("proxy_manager.tor_country.clear_tor_hint_cache", lambda: None)
+    monkeypatch.setattr(
+        "proxy_manager.tor_country.start_managed_tor",
+        lambda country="": (True, "up"),
+    )
+    monkeypatch.setattr("proxy_manager.tor_country.wait_for_socks_circuit", lambda port, timeout=45: True)
+    noted: list[int] = []
+    monkeypatch.setattr("proxy_manager.tor_country.note_live_circuit", lambda port: noted.append(port))
+    ok, msg, port = adopt_fresh_tor_after_clock_jump()
+    assert ok is True
+    assert port == 9051
+    assert noted == [9051]
+    assert "9051" in msg
+
+
 def test_live_circuit_hides_soft_hint_until_traffic_fails(monkeypatch):
     from proxy_manager.tor_country import clear_tor_hint_cache, note_live_circuit, tor_failure_hint
 

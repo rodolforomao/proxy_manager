@@ -44,6 +44,10 @@ _BIND_RE = re.compile(
 )
 _HOP_RE = re.compile(r"Failed to find node for hop #(\d+)")
 _RESTRICT_RE = re.compile(r"path restriction type (\d+)")
+_CLOCK_JUMP_RE = re.compile(
+    r"system clock just jumped (\d+) seconds forward",
+    re.IGNORECASE,
+)
 _LOG_TS_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)\s+"
 )
@@ -53,6 +57,10 @@ _PROBE_TTL = 20.0
 # Reclamação de circuito depois do bootstrap. Mais velha que isso não bloqueia:
 # o journal guarda o timeout, mas um circuito novo pode já ter fechado.
 _CIRCUIT_EVENT_MAX_AGE = timedelta(minutes=10)
+# O salto do relógio (suspensão) continua valendo depois que o "Tried for Ns"
+# sai da janela curta: o daemon segue sem circuito.
+_CLOCK_JUMP_MAX_AGE = timedelta(hours=3)
+_REPLACE_WAIT = 45.0
 _hint_cache: dict[tuple[int, bool], tuple[float, str]] = {}
 _live_ok: dict[int, float] = {}
 _probe_cache: dict[int, tuple[float, bool]] = {}
@@ -200,6 +208,8 @@ def diagnose_tor_log(
     hop_at = -1
     restrict_type = ""
     restrict_at = -1
+    clock_jump_s = ""
+    clock_jump_at = -1
     for idx, line in enumerate(text.splitlines()):
         fresh = _circuit_line_is_fresh(line, clock)
         match = _MISSING_PROTO_RE.search(line)
@@ -235,6 +245,10 @@ def diagnose_tor_log(
         if match and fresh:
             restrict_type = match.group(1)
             restrict_at = idx
+        match = _CLOCK_JUMP_RE.search(line)
+        if match and fresh:
+            clock_jump_s = match.group(1)
+            clock_jump_at = idx
         match = _RESET_RE.search(line)
         if match:
             reset_reason = match.group(1).upper()
@@ -258,13 +272,19 @@ def diagnose_tor_log(
     soft_current = soft_timeout and _still_current(soft_at)
     hop_current = bool(hop_n) and _still_current(hop_at)
     restrict_current = bool(restrict_type) and _still_current(restrict_at)
+    clock_current = bool(clock_jump_s) and _still_current(clock_jump_at)
     route_discarded = traffic_failed and (hop_current or restrict_current)
     circuits_bad = bool(
         guard_current or timeout_current or reset_current or (traffic_failed and soft_current)
     )
     stuck_current = stuck is not None and _still_current(stuck_at)
     broken = bool(
-        bind_error or circuits_bad or stuck_current or (traffic_failed and missing) or route_discarded
+        bind_error
+        or circuits_bad
+        or stuck_current
+        or clock_current
+        or (traffic_failed and missing)
+        or route_discarded
     )
     if not broken:
         return ""
@@ -294,6 +314,12 @@ def diagnose_tor_log(
             f"Tor{ver} está preso no bootstrap {stuck[0]}% ({stuck[1]}). "
             "A porta pode responder, mas ainda não há circuito utilizável."
         )
+    if clock_current:
+        # O "Tried for Ns" do mesmo instante é o salto, não uma espera real.
+        return (
+            f"Tor{ver} descartou os circuitos: o relógio avançou {clock_jump_s}s "
+            "(suspensão ou ajuste do relógio). Ainda não há circuito novo."
+        )
     waited = f" ({timeout_s}s)" if timeout_current and timeout_s else ""
     if reset_current:
         count_txt = f", {reset_count} tentativas" if reset_count else ""
@@ -313,7 +339,58 @@ def diagnose_tor_log(
 
 def circuit_hint_can_recover(hint: str) -> bool:
     """Falha de circuito depois do bootstrap. Um SOCKS novo pode mostrar que já passou."""
-    return "circuitos não fecham" in hint
+    return "circuitos não fecham" in hint or "relógio avançou" in hint
+
+
+def clock_jump_seconds_from_log(
+    text: str,
+    *,
+    now: datetime | None = None,
+    max_age: timedelta = _CLOCK_JUMP_MAX_AGE,
+) -> int:
+    """Último salto do relógio ainda dentro da janela. 0 se não houver."""
+    clock = now or datetime.now().astimezone()
+    found = 0
+    for line in text.splitlines():
+        match = _CLOCK_JUMP_RE.search(line)
+        if not match:
+            continue
+        ts = _LOG_TS_RE.match(line)
+        if ts:
+            try:
+                seen = datetime.fromisoformat(ts.group("ts").replace("Z", "+00:00"))
+            except ValueError:
+                seen = None
+            if seen is not None:
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=clock.tzinfo)
+                if clock - seen > max_age:
+                    continue
+        found = int(match.group(1))
+    return found
+
+
+def system_clock_jump_seconds() -> int:
+    text = _journal_text(["-n", "3", "-g", "clock just jumped"])
+    return clock_jump_seconds_from_log(text)
+
+
+def clock_jump_block(port: int) -> str:
+    """Salto do relógio fora da janela curta do log, enquanto o SOCKS não abre circuito."""
+    if port != DEFAULT_SYSTEM_TOR_PORT or _live_circuit_recent(port):
+        return ""
+    seconds = system_clock_jump_seconds()
+    if not seconds:
+        return ""
+    if socks_circuit_open(port):
+        note_live_circuit(port)
+        return ""
+    version = _tor_version()
+    ver = f" {version}" if version else ""
+    return (
+        f"Tor{ver} descartou os circuitos: o relógio avançou {seconds}s "
+        "(suspensão ou ajuste do relógio). Ainda não há circuito novo."
+    )
 
 
 def _live_circuit_recent(port: int) -> bool:
@@ -337,11 +414,11 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return data
 
 
-def socks_circuit_open(port: int, timeout: float = 2.5) -> bool:
+def socks_circuit_open(port: int, timeout: float = 2.5, *, use_cache: bool = True) -> bool:
     """Abre um circuito SOCKS novo. Verdadeiro se o Tor aceitar o CONNECT."""
     cached = _probe_cache.get(port)
     now = time.monotonic()
-    if cached and now - cached[0] < _PROBE_TTL:
+    if use_cache and cached and now - cached[0] < _PROBE_TTL:
         return cached[1]
     ok = False
     sock: socket.socket | None = None
@@ -363,6 +440,55 @@ def socks_circuit_open(port: int, timeout: float = 2.5) -> bool:
             sock.close()
     _probe_cache[port] = (time.monotonic(), ok)
     return ok
+
+
+def wait_for_socks_circuit(port: int, timeout: float = _REPLACE_WAIT) -> bool:
+    """Tenta vários CONNECT até o circuito fechar ou o processo cair."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        slice_timeout = min(5.0, max(0.5, deadline - time.monotonic()))
+        if socks_circuit_open(port, timeout=slice_timeout, use_cache=False):
+            return True
+        if _read_pid() is None and not is_port_open("127.0.0.1", port):
+            return False
+        time.sleep(0.4)
+    return False
+
+
+def adopt_fresh_tor_after_clock_jump() -> tuple[bool, str, int]:
+    """Troca o Tor do sistema, sem circuito depois do salto do relógio, por um processo novo.
+
+    O daemon já bootstrapped deixa de escolher o primeiro salto. Um processo novo
+    volta a fazer handshake. Se a porta 9051 já é nossa, continua o mesmo processo
+    em vez de zerar o bootstrap.
+    """
+    already = is_port_open("127.0.0.1", MANAGED_TOR_PORT) and _read_pid() is not None
+    if not already:
+        stop_managed_tor()
+        clear_tor_hint_cache()
+        ok, msg = start_managed_tor("")
+        if not ok:
+            return False, msg, DEFAULT_SYSTEM_TOR_PORT
+    if wait_for_socks_circuit(MANAGED_TOR_PORT):
+        note_live_circuit(MANAGED_TOR_PORT)
+        return (
+            True,
+            f"Tor novo em 127.0.0.1:{MANAGED_TOR_PORT} "
+            "(o do sistema perdeu os circuitos quando o relógio avançou)",
+            MANAGED_TOR_PORT,
+        )
+    hint = tor_failure_hint(MANAGED_TOR_PORT, traffic_failed=True, force=True)
+    prefix = (
+        "O relógio avançou e o Tor do sistema descartou os circuitos. "
+        f"Um Tor novo segue em 127.0.0.1:{MANAGED_TOR_PORT}. "
+    )
+    if hint:
+        return False, prefix + hint, MANAGED_TOR_PORT
+    return (
+        False,
+        prefix + "Ainda não abriu um circuito. Ligue de novo em instantes.",
+        MANAGED_TOR_PORT,
+    )
 
 
 def tor_failure_hint(port: int, *, traffic_failed: bool = False, force: bool = False) -> str:
