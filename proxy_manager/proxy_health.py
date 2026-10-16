@@ -391,6 +391,13 @@ def wait_for_proxy_verification(
     on_attempt: Callable[[int, int, str], None] | None = None,
 ) -> tuple[bool, PublicIpInfo, PublicIpInfo | None, str]:
     """Poll até confirmar IP ou esgotar tentativas."""
+    if getattr(proxy, "source", "") == "tor":
+        from proxy_manager.proxy_sources import tor_circuit_block
+
+        block = tor_circuit_block(int(getattr(proxy, "upstream_port", 0) or 9050))
+        if block:
+            return False, PublicIpInfo(ip=None), direct_info, block
+
     if direct_info is None or not direct_info.ip:
         direct_info = fetch_public_ip_info_direct(force=True, timeout=timeout)
 
@@ -408,7 +415,34 @@ def wait_for_proxy_verification(
         if attempt < max_attempts:
             time.sleep(poll_interval)
 
+    if proxy.source == "tor":
+        last_msg = activation_failure_detail(proxy, last_msg, keep_fallback=bool(proxy_info.ip))
     return False, proxy_info, direct_info, last_msg
+
+
+def activation_failure_detail(
+    proxy: ProxySettings,
+    fallback: str,
+    *,
+    keep_fallback: bool = False,
+) -> str:
+    """Quando o Tor não entrega tráfego, troca o erro genérico pela causa do log."""
+    if getattr(proxy, "source", "") != "tor":
+        return fallback
+    from proxy_manager.tor_country import tor_failure_hint
+
+    port = int(getattr(proxy, "upstream_port", 0) or 9050)
+    hint = tor_failure_hint(port, traffic_failed=True, force=True)
+    if not hint:
+        if keep_fallback:
+            return fallback
+        return (
+            f"{fallback} SOCKS em 127.0.0.1:{port} não entregou tráfego "
+            "e o log recente do Tor não mostrou a causa."
+        )
+    if keep_fallback and fallback and hint not in fallback:
+        return f"{fallback}\n{hint}"
+    return hint
 
 
 def detect_listening_proxy_ports(host: str = "127.0.0.1") -> list[int]:

@@ -121,6 +121,7 @@ from proxy_manager.proxy_health import (
     fetch_public_ip_info_direct,
     fetch_public_ip_info_via_proxy,
     format_ip_with_flag,
+    activation_failure_detail,
     is_proxy_mode_verified,
     test_proxy_api,
     wait_for_proxy_verification,
@@ -140,11 +141,13 @@ from proxy_manager.proxy_sources import (
     proxy_source_badge,
     settings_configured,
     test_free_proxies,
+    tor_circuit_block,
     tor_status,
     try_start_tor,
     verify_local_proxy_chain,
 )
 from proxy_manager import ssh_socks_tunnel as ssh_socks
+from proxy_manager.tor_country import tor_failure_hint
 
 
 CATEGORY_LABELS = {
@@ -662,6 +665,7 @@ class ProxyManagerApp(ctk.CTk):
         on_done: Callable[[bool], None] | None,
     ) -> None:
         self._auto_config_running = False
+        self._autoconfig_detail = "" if ok else (msg or "")
         if ok:
             self.store.save()
             self._reload_proxy_form_from_store()
@@ -930,13 +934,15 @@ class ProxyManagerApp(ctk.CTk):
             b["badge"].configure(border_color=color if active else "#334155")
             b["tooltip"].set_text(tip)
 
-        tor_on, tor_msg = tor_status(self.store.proxy.upstream_port or DEFAULT_TOR_PORT)
+        tor_port = self.store.proxy.upstream_port or DEFAULT_TOR_PORT
+        tor_on, tor_msg = tor_status(tor_port)
+        tor_hint = tor_failure_hint(tor_port) if tor_on else ""
         _set(
             "tor",
-            f"on :{self.store.proxy.upstream_port or DEFAULT_TOR_PORT}" if tor_on else "off",
+            "falha" if tor_hint else (f"on :{tor_port}" if tor_on else "off"),
             active=tor_on,
-            tip=f"Tor\n{tor_msg}",
-            color=TOR_COLOR,
+            tip=f"Tor\n{tor_hint or tor_msg}",
+            color="#f87171" if tor_hint else TOR_COLOR,
         )
 
         wifi_iface = next((i for i in list_interfaces() if i.kind == "wifi"), None)
@@ -1527,12 +1533,19 @@ class ProxyManagerApp(ctk.CTk):
 
         def _on_configure_fail(prev_v: bool, msg: str) -> None:
             self._auto_config_running = False
-            self._proxy_verified = prev_v
+            if is_running():
+                self._proxy_verified = prev_v
+            else:
+                self._proxy_verified = False
+                self.store.proxy.enabled = False
+                self.store.save()
+                self.global_proxy_var.set(False)
             self._sync_auto_mode_header()
             self._update_header_from_processes(self._scanner.cache)
             self._sync_global_switch_label()
             self._request_scan(min_interval=2.0)
-            self._toast(msg, "warning")
+            self.status_label.configure(text=(msg or "Falha ao configurar o proxy.")[:120], text_color="#f97316")
+            self._toast(msg, "warning", duration_ms=12000)
 
         def worker() -> None:
             try:
@@ -1566,14 +1579,32 @@ class ProxyManagerApp(ctk.CTk):
                     )
                     return
 
-                if not verify_local_proxy_chain(timeout=12):
+                block = self._tor_circuit_block_now()
+                if block:
                     self.after(
                         0,
-                        lambda: self._on_proxy_activation_verified(
+                        lambda d=block: self._on_proxy_activation_verified(
                             False,
                             PublicIpInfo(ip=None),
                             None,
-                            "Proxy local ligado, mas o tráfego não passou.",
+                            d,
+                            config_msg,
+                        ),
+                    )
+                    return
+
+                if not verify_local_proxy_chain(timeout=12):
+                    detail = activation_failure_detail(
+                        self.store.proxy,
+                        "Proxy local ligado, mas o tráfego não passou.",
+                    )
+                    self.after(
+                        0,
+                        lambda d=detail: self._on_proxy_activation_verified(
+                            False,
+                            PublicIpInfo(ip=None),
+                            None,
+                            d,
                             config_msg,
                         ),
                     )
@@ -1727,16 +1758,21 @@ class ProxyManagerApp(ctk.CTk):
         else:
             self._proxy_verified = False
             self._proxy_ip_info = proxy_info if proxy_info.ip else None
-            # Verificação falhou: não deixe Claude/browsers apontando à 7890 morta.
-            self._resync_persistent_app_proxies(local_proxy_active=False)
             detail = verify_msg or config_msg or "Falha na verificação."
+            # Processo, interruptor e config ficam desligados juntos.
+            self.store.proxy.enabled = False
+            self.store.save()
+            self.global_proxy_var.set(False)
+            self._resync_persistent_app_proxies(local_proxy_active=False)
             self._sync_auto_mode_header()
             self._update_header_from_processes(self._scanner.cache, preserve_status=True)
             self._sync_global_switch_label()
             self._request_scan(min_interval=2.0)
-            notify_proxy_error(detail[:80])
+            notify_proxy_error(detail[:240])
             self._update_brand_icon(proxy_on=False)
-            self._toast(detail, "warning")
+            self.status_label.configure(text=detail[:120], text_color="#f97316")
+            self._toast(detail, "warning", duration_ms=12000)
+            self._stop_local_proxy_quietly()
             return
 
         self._sync_auto_mode_header()
@@ -2447,7 +2483,9 @@ class ProxyManagerApp(ctk.CTk):
         self.tor_port_entry.insert(0, str(port))
         self.tor_port_entry.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        self.tor_status_label = ctk.CTkLabel(self.tor_panel, text="", anchor="w")
+        self.tor_status_label = ctk.CTkLabel(
+            self.tor_panel, text="", anchor="w", wraplength=520, justify="left"
+        )
         self.tor_status_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
         self.after(0, self._refresh_tor_status)
 
@@ -2491,7 +2529,12 @@ class ProxyManagerApp(ctk.CTk):
             return DEFAULT_TOR_PORT
 
     def _refresh_tor_status(self) -> None:
-        ok, msg = tor_status(self._tor_port_value())
+        port = self._tor_port_value()
+        ok, msg = tor_status(port)
+        hint = tor_failure_hint(port) if ok else ""
+        if hint:
+            self.tor_status_label.configure(text=hint, text_color="#fbbf24")
+            return
         color = "#4ade80" if ok else "#f87171"
         self.tor_status_label.configure(text=msg, text_color=color)
 
@@ -2505,8 +2548,12 @@ class ProxyManagerApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_tor_start_done(self, ok: bool, msg: str) -> None:
+        hint = tor_failure_hint(self._tor_port_value(), force=True) if ok else ""
         self._refresh_tor_status()
-        self._toast(msg, "success" if ok else "warning")
+        if hint:
+            self._toast(hint, "warning", duration_ms=12000)
+            return
+        self._toast(msg, "success" if ok else "warning", duration_ms=8000 if not ok else 5000)
 
     def _apply_tor_to_form(self) -> None:
         apply_tor(self.store.proxy, self._tor_port_value())
@@ -4005,15 +4052,50 @@ class ProxyManagerApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _tor_circuit_block_now(self) -> str:
+        """Falha já explicada pelo log do Tor. Vazio para outros modos ou Tor ainda subindo."""
+        if getattr(self.store.proxy, "source", "") != "tor":
+            return ""
+        return tor_circuit_block(self.store.proxy.upstream_port or DEFAULT_TOR_PORT)
+
+    def _stop_local_proxy_quietly(self) -> None:
+        """Encerra o processo da 7890 sem trocar o aviso que já está na tela."""
+
+        def worker() -> None:
+            stop_watchdog()
+            stop_local_proxy()
+            self.after(0, self._sync_global_switch_label)
+            self.after(0, self._update_network_status_strip)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _verify_proxy_chain_worker(self, start_msg: str) -> None:
-        if not verify_local_proxy_chain(timeout=12):
+        block = self._tor_circuit_block_now()
+        if block:
             self.after(
                 0,
-                lambda: self._on_proxy_activation_verified(
+                lambda d=block: self._on_proxy_activation_verified(
                     False,
                     PublicIpInfo(ip=None),
                     None,
-                    "Proxy local ligado, mas o tráfego não passou.",
+                    d,
+                    start_msg,
+                ),
+            )
+            return
+
+        if not verify_local_proxy_chain(timeout=12):
+            detail = activation_failure_detail(
+                self.store.proxy,
+                "Proxy local ligado, mas o tráfego não passou.",
+            )
+            self.after(
+                0,
+                lambda d=detail: self._on_proxy_activation_verified(
+                    False,
+                    PublicIpInfo(ip=None),
+                    None,
+                    d,
                     start_msg,
                 ),
             )
@@ -4134,14 +4216,24 @@ class ProxyManagerApp(ctk.CTk):
             self._proxy_ip_updated_at = 0.0
             self._start_proxy_in_background(restart=is_running())
         else:
-            # Auto-config falhou — mantém switch em âmbar "aguardando"
             self._auto_config_running = False
             self._proxy_verified = False
-            self._sync_global_switch_label()
-            self.status_label.configure(
-                text="Proxy não encontrado — escolha ⚡ ou 🧅 para tentar outro modo",
-                text_color="#f97316",
+            detail = getattr(self, "_autoconfig_detail", "") or (
+                "Proxy não encontrado — escolha ⚡ ou 🧅 para tentar outro modo"
             )
+            # Proxy já habilitado e no ar continua. Órfão (processo sem enabled) é encerrado.
+            if is_running() and self.store.proxy.enabled:
+                self.global_proxy_var.set(True)
+            else:
+                self.global_proxy_var.set(False)
+                if self.store.proxy.enabled:
+                    self.store.proxy.enabled = False
+                    self.store.save()
+                if is_running():
+                    self._stop_local_proxy_quietly()
+            self._sync_global_switch_label()
+            self.status_label.configure(text=detail[:120], text_color="#f97316")
+            self._toast(detail, "warning", duration_ms=12000)
 
     def _apply_settings_from_form(self) -> bool:
         source = self._source_key_from_label(self.source_var.get())

@@ -498,10 +498,24 @@ def tor_status(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
     )
 
 
+def tor_circuit_block(port: int = DEFAULT_TOR_PORT) -> str:
+    """Motivo para não tratar a porta SOCKS como circuito pronto. Vazio se o log não acusa falha.
+
+    Porta fechada não consulta o journal: o aviso de instalação vem de tor_status.
+    Um bootstrap que já chegou a 100% também fica vazio.
+    """
+    if not is_port_open("127.0.0.1", port):
+        return ""
+    from proxy_manager.tor_country import tor_failure_hint
+
+    return tor_failure_hint(port)
+
+
 def try_start_tor(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
     if is_port_open("127.0.0.1", port):
         return True, tor_status(port)[1]
 
+    errors: list[str] = []
     for cmd in (
         ["systemctl", "start", "tor"],
         ["pkexec", "systemctl", "start", "tor"],
@@ -513,14 +527,27 @@ def try_start_tor(port: int = DEFAULT_TOR_PORT) -> tuple[bool, str]:
                 text=True,
                 timeout=30,
             )
-            if result.returncode == 0:
-                time.sleep(1.0)
-                if is_port_open("127.0.0.1", port):
-                    return True, f"Tor iniciado em 127.0.0.1:{port}"
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc))
             continue
+        if result.returncode == 0:
+            time.sleep(1.0)
+            if is_port_open("127.0.0.1", port):
+                return True, f"Tor iniciado em 127.0.0.1:{port}"
+            errors.append(
+                f"{' '.join(cmd)} retornou ok, mas 127.0.0.1:{port} não abriu."
+            )
+            continue
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            errors.append(detail.splitlines()[-1][:300])
+        else:
+            errors.append(f"{' '.join(cmd)} falhou (código {result.returncode}).")
 
-    return False, tor_status(port)[1]
+    message = tor_status(port)[1]
+    if errors:
+        message = f"{message}\n{errors[-1]}"
+    return False, message
 
 
 def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
@@ -531,6 +558,9 @@ def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
         ok, msg, port = ensure_tor_for_country(country)
         if not ok:
             return False, msg
+        block = tor_circuit_block(port)
+        if block:
+            return False, block
         apply_tor(settings, port)
         if country:
             return True, f"Tor {country.upper()} — socks5://127.0.0.1:{port}"
@@ -540,6 +570,9 @@ def _auto_configure_tor(settings: ProxySettings) -> tuple[bool, str]:
     ok, msg = try_start_tor(DEFAULT_TOR_PORT)
     if not ok:
         return False, msg
+    block = tor_circuit_block(DEFAULT_TOR_PORT)
+    if block:
+        return False, block
     apply_tor(settings, DEFAULT_TOR_PORT)
     return True, f"Tor — socks5://127.0.0.1:{DEFAULT_TOR_PORT}"
 
@@ -679,9 +712,13 @@ def settings_configured(settings: ProxySettings) -> tuple[bool, str]:
     if settings.source == "direct":
         return True, "ok"
     if settings.source == "tor":
-        ok, msg = tor_status(settings.upstream_port or DEFAULT_TOR_PORT)
+        port = settings.upstream_port or DEFAULT_TOR_PORT
+        ok, msg = tor_status(port)
         if not ok:
             return False, msg
+        block = tor_circuit_block(port)
+        if block:
+            return False, block
         return True, "ok"
 
     host = settings.upstream_host.strip()
