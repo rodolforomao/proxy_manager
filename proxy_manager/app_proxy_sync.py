@@ -8,11 +8,16 @@ from __future__ import annotations
 
 from proxy_manager.browser_proxy import is_browser_app, prepare_browser_proxy
 from proxy_manager.claude_proxy import is_claude_app, prepare_claude_proxy
+from proxy_manager.elements_proxy import is_elements_app, write_conf_proxy
 from proxy_manager.models import AppRule, ProxySettings
 
 
 def clear_persistent_app_proxies(apps: list[AppRule], proxy: ProxySettings) -> list[str]:
-    """Remove proxy de Claude/browsers. Retorna IDs alterados."""
+    """Remove proxy de Claude, browsers e conf do Elements. Retorna IDs alterados.
+
+    No Elements só edita o arquivo. Não recria container: no desligamento não há
+    tempo, e no próximo boot o elementsd lê o conf já sem proxy.
+    """
     changed: list[str] = []
     for app in apps:
         try:
@@ -21,6 +26,9 @@ def clear_persistent_app_proxies(apps: list[AppRule], proxy: ProxySettings) -> l
                 changed.append(app.id)
             elif is_browser_app(app):
                 prepare_browser_proxy(app, proxy, use_proxy=False)
+                changed.append(app.id)
+            elif is_elements_app(app):
+                write_conf_proxy(app.id, enable=False)
                 changed.append(app.id)
         except Exception:
             continue

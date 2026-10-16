@@ -53,6 +53,7 @@ from proxy_manager.elements_proxy import (
     is_elements_app,
     start_bridge_watchdog,
     stop_bridge_watchdog,
+    stop_tor_bridge,
     stop_tor_bridge_if_unused,
 )
 from proxy_manager.config import ConfigStore
@@ -198,6 +199,7 @@ class ProxyManagerApp(ctk.CTk):
         self._auto_config_running = False
         self._proxy_verified = False
         self._shutdown_done = False
+        self._shutdown_lock = threading.Lock()
         self._pending_reapply_app_ids: list[str] = []
         self._quick_app_tiles: dict[str, dict] = {}
         self._mode_tiles: dict[str, ctk.CTkFrame] = {}
@@ -5542,36 +5544,41 @@ class ProxyManagerApp(ctk.CTk):
 
     def _shutdown_cleanup_proxy_state(self) -> None:
         """Destroyer: limpa configs externas e para o proxy local (idempotente)."""
-        if self._shutdown_done:
-            return
-        self._shutdown_done = True
-        try:
-            stop_watchdog()
-        except Exception:
-            pass
-        try:
-            stop_bridge_watchdog()
-        except Exception:
-            pass
-        try:
-            clear_persistent_app_proxies(self.store.apps, self.store.proxy)
-        except Exception:
-            pass
-        try:
-            force_stop_local_proxy()
-        except Exception:
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
             try:
-                stop_local_proxy()
+                stop_watchdog()
             except Exception:
                 pass
-        try:
-            self.store.proxy.enabled = False
-            for app in self.store.apps:
-                if is_claude_app(app) and app.use_proxy:
-                    app.use_proxy = False
-            self.store.save()
-        except Exception:
-            pass
+            try:
+                stop_bridge_watchdog()
+            except Exception:
+                pass
+            try:
+                clear_persistent_app_proxies(self.store.apps, self.store.proxy)
+            except Exception:
+                pass
+            try:
+                stop_tor_bridge()
+            except Exception:
+                pass
+            try:
+                force_stop_local_proxy()
+            except Exception:
+                try:
+                    stop_local_proxy()
+                except Exception:
+                    pass
+            try:
+                self.store.proxy.enabled = False
+                for app in self.store.apps:
+                    if is_claude_app(app) and app.use_proxy:
+                        app.use_proxy = False
+                self.store.save()
+            except Exception:
+                pass
 
     def on_closing(self) -> None:
         self._modal_open = False
@@ -5603,23 +5610,13 @@ class ProxyManagerApp(ctk.CTk):
         except Exception:
             pass
 
-    def _on_destroy_signal(self, _signum=None, _frame=None) -> None:
-        """SIGINT/SIGTERM → mesmo path de fechamento limpo."""
-        try:
-            self.after(0, self.on_closing)
-        except Exception:
-            self._shutdown_cleanup_proxy_state()
-
     def _register_destroy_hooks(self) -> None:
-        """Registra destroyers do sistema (janela, sinais, atexit)."""
+        """Registra destroyers do sistema (janela, sinais, logind, atexit)."""
+        from proxy_manager.session_teardown import arm_session_teardown
+
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         atexit.register(self._shutdown_cleanup_proxy_state)
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                signal.signal(sig, self._on_destroy_signal)
-            except (ValueError, OSError):
-                # Em threads secundárias signal.signal pode falhar.
-                pass
+        arm_session_teardown(self, self._shutdown_cleanup_proxy_state)
 
 
 def _slug_id(name: str) -> str:
