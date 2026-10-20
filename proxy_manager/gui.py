@@ -168,6 +168,7 @@ SECTION_RECENT = "◷ Recentes"
 # consistente em qualquer lugar da UI que indique um dos dois.
 TOR_COLOR = "#f97316"
 SOCKS5_COLOR = "#60a5fa"
+PROXY77_COLOR = "#a78bfa"
 
 
 class ProxyManagerApp(ctk.CTk):
@@ -646,13 +647,24 @@ class ProxyManagerApp(ctk.CTk):
 
     def _start_auto_configure(self, on_done: Callable[[bool], None] | None = None) -> None:
         if self._auto_config_running:
+            # Já em andamento: não engolir o callback (senão a UI fica em CONFIGURANDO).
+            if on_done:
+                self._toast(
+                    "Configuração automática em andamento. Aguarde o indicador ficar verde.",
+                    "info",
+                )
             return
         if settings_configured(self.store.proxy)[0]:
             on_done and on_done(True)
             return
 
         self._auto_config_running = True
-        self.status_label.configure(text="Configurando proxy automaticamente…")
+        self._proxy_verified = False
+        self._sync_global_switch_label()
+        self.status_label.configure(
+            text="Configurando proxy automaticamente…",
+            text_color="#fbbf24",
+        )
 
         def worker() -> None:
             ok, msg = auto_configure_proxy(self.store.proxy)
@@ -809,6 +821,9 @@ class ProxyManagerApp(ctk.CTk):
         self._build_ssh_socks_tile(row1)
         self.after(300, lambda: self._sync_ssh_socks_button(update_svc=True))
 
+        self._build_proxy77_tile(row1)
+        self.after(300, self._sync_proxy77_button)
+
         self._iface_bar = ctk.CTkFrame(row1, fg_color="transparent")
         self._iface_bar.pack(side="left", padx=(8, 0))
         self._iface_header_tiles: dict[str, ctk.CTkFrame] = {}
@@ -838,7 +853,7 @@ class ProxyManagerApp(ctk.CTk):
         Tooltip(
             country_bar,
             "⚡ Rápido: proxy público no país escolhido\n"
-            "🧅 Tor: usa saída aleatória (Tor do sistema :9050)\n"
+            "🧅 Tor: SOCKS em 127.0.0.1:9050 (Tor gerenciado pelo app)\n"
             "Saída Tor por país — em breve",
         )
 
@@ -1255,6 +1270,140 @@ class ProxyManagerApp(ctk.CTk):
             self.after(0, _finish)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ── Proxy via túnel SSH (ex.: 77.111.101.238) — alternativa ao Tor ───────
+    # Reaproveita o mesmo túnel SOCKS5 do botão S5 (RustDesk), mas aqui ele
+    # passa a ser o UPSTREAM do proxy local (:7890) — útil quando a rede
+    # bloqueia o handshake do Tor (DPI) e um SOCKS5 comum ainda passa.
+
+    def _build_proxy77_tile(self, parent: ctk.CTkFrame) -> None:
+        tile = ctk.CTkFrame(
+            parent,
+            width=52,
+            height=44,
+            corner_radius=10,
+            fg_color="#334155",
+            border_width=2,
+            border_color="#475569",
+            cursor="hand2",
+        )
+        tile.pack(side="left", padx=(8, 0))
+        tile.pack_propagate(False)
+
+        icon_lbl = ctk.CTkLabel(
+            tile,
+            text="77",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#cbd5e1",
+        )
+        icon_lbl.place(relx=0.5, rely=0.32, anchor="center")
+        state_lbl = ctk.CTkLabel(
+            tile,
+            text="off",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#94a3b8",
+        )
+        state_lbl.place(relx=0.5, rely=0.72, anchor="center")
+
+        self._proxy77_btn = tile
+        self._proxy77_icon = icon_lbl
+        self._proxy77_state = state_lbl
+        self._proxy77_tooltip = Tooltip(tile, self._proxy77_tooltip_text())
+
+        def _click(_e=None) -> None:
+            self._toggle_proxy_via_77()
+
+        for w in (tile, icon_lbl, state_lbl):
+            w.bind("<Button-1>", _click)
+
+    def _proxy77_tooltip_text(self) -> str:
+        host = (self.store.ssh_tunnel.host or "").strip() or "(configure em Configurações)"
+        return (
+            f"Usa {host} (túnel SSH SOCKS5) como proxy principal\n"
+            "Alternativa ao Tor quando a rede bloqueia o handshake dele.\n"
+            f"Compartilha o túnel do botão S5 — 127.0.0.1:{ssh_socks.DEFAULT_LOCAL_PORT}."
+        )
+
+    def _is_proxy_via_77_active(self) -> bool:
+        p = self.store.proxy
+        return (
+            p.source == "custom"
+            and p.upstream_host == "127.0.0.1"
+            and p.upstream_port == ssh_socks.DEFAULT_LOCAL_PORT
+        )
+
+    def _sync_proxy77_button(self) -> None:
+        if not hasattr(self, "_proxy77_btn"):
+            return
+        active = self._is_proxy_via_77_active()
+        if active:
+            self._proxy77_btn.configure(border_color=PROXY77_COLOR, fg_color="#382a5f")
+            self._proxy77_icon.configure(text_color=PROXY77_COLOR)
+            self._proxy77_state.configure(text="on", text_color=PROXY77_COLOR)
+        else:
+            self._proxy77_btn.configure(border_color="#475569", fg_color="#334155")
+            self._proxy77_icon.configure(text_color="#cbd5e1")
+            self._proxy77_state.configure(text="off", text_color="#94a3b8")
+        if hasattr(self, "_proxy77_tooltip"):
+            self._proxy77_tooltip.set_text(self._proxy77_tooltip_text())
+
+    def _toggle_proxy_via_77(self) -> None:
+        if self._auto_config_running:
+            return
+        if self._is_proxy_via_77_active():
+            self._disable_proxy_via_77()
+        else:
+            self._enable_proxy_via_77()
+
+    def _enable_proxy_via_77(self) -> None:
+        host = (self.store.ssh_tunnel.host or "").strip()
+        if not host:
+            self._toast(
+                "Configure o host do túnel SSH em Configurações → Túnel SSH SOCKS5.",
+                "error",
+            )
+            return
+
+        self._proxy77_state.configure(text="…", text_color="#fbbf24")
+        self.status_label.configure(
+            text=f"Subindo túnel SSH até {host}…", text_color="#fbbf24"
+        )
+
+        def worker() -> None:
+            if ssh_socks.is_running():
+                ok, msg = True, "túnel já ligado"
+            else:
+                ok, msg = ssh_socks.start_tunnel(self.store.ssh_tunnel)
+            self.after(0, lambda: self._after_proxy77_tunnel(ok, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_proxy77_tunnel(self, tunnel_ok: bool, tunnel_msg: str) -> None:
+        self._sync_ssh_socks_button(update_svc=True)
+        if not tunnel_ok:
+            self._sync_proxy77_button()
+            self._toast(f"Túnel SSH falhou: {tunnel_msg}", "error")
+            return
+
+        p = self.store.proxy
+        p.source = "custom"  # type: ignore[assignment]
+        p.scheme = "socks5"  # type: ignore[assignment]
+        p.upstream_host = "127.0.0.1"
+        p.upstream_port = ssh_socks.DEFAULT_LOCAL_PORT
+        p.username = ""
+        p.password = ""
+        p.enabled = True
+        self.store.save()
+        self.global_proxy_var.set(True)
+        self._sync_proxy77_button()
+        self._sync_auto_mode_header()
+        self._start_proxy_in_background(restart=is_running())
+
+    def _disable_proxy_via_77(self) -> None:
+        mode = getattr(self.store.proxy, "auto_proxy_mode", "tor")
+        if mode not in ("fast", "tor"):
+            mode = "tor"
+        self._select_auto_proxy_mode(mode, force=True)
 
     def _active_auto_mode_key(self) -> str:
         p = self.store.proxy
@@ -2112,7 +2261,7 @@ class ProxyManagerApp(ctk.CTk):
             "• Fonte: Personalizado, Gratuito, Pago ou Tor.\n"
             "• Gratuito: busca listas públicas (qualidade variável).\n"
             "• Pago: templates Smartproxy, Bright Data, Oxylabs, etc.\n"
-            "• Tor: SOCKS5 em 127.0.0.1:9050 (precisa do serviço tor).\n"
+            "• Tor: SOCKS5 em 127.0.0.1:9050 (o app sobe o Tor e assume a porta).\n"
             "• Interruptor PROXY LIGADO no topo; por app use Ligar proxy.\n",
         )
         info.configure(state="disabled")
@@ -2470,7 +2619,7 @@ class ProxyManagerApp(ctk.CTk):
         ctk.CTkLabel(
             self.tor_panel,
             text=(
-                "Usa SOCKS5 do Tor em 127.0.0.1:9050 (serviço do sistema). "
+                "Usa SOCKS5 do Tor em 127.0.0.1:9050 (gerenciado pelo app). "
                 "O seletor «País» no topo aplica-se ao modo ⚡ Rápido; "
                 "saída Tor por país será testada numa próxima versão."
             ),
@@ -3078,6 +3227,7 @@ class ProxyManagerApp(ctk.CTk):
         # Durante troca Tor/Rápido, não reconsultar o túnel S5 (evita ruído/lag).
         if not self._auto_config_running:
             self._sync_ssh_socks_button(update_svc=False)
+        self._sync_proxy77_button()
         if is_running() and self._proxy_verified:
             self._maybe_fetch_public_ip(processes, force=False)
 
@@ -4127,9 +4277,27 @@ class ProxyManagerApp(ctk.CTk):
     def _start_proxy_in_background(self, *, restart: bool) -> None:
         self._auto_config_running = True
         self._proxy_verified = False
+        self._sync_global_switch_label()
         self._set_swap_status("Iniciando…")
 
         def worker() -> None:
+            # Tor: garante SOCKS :9050 antes do proxy local (HTTP :7890).
+            if getattr(self.store.proxy, "source", "") == "tor":
+                from proxy_manager.tor_country import ensure_tor_for_country
+
+                country = getattr(self.store.proxy, "target_country", "") or ""
+                tok, tmsg, tport = ensure_tor_for_country(country)
+                if not tok:
+                    self.after(
+                        0,
+                        lambda m=tmsg: self._on_proxy_activation_verified(
+                            False, PublicIpInfo(ip=None), None, m, m
+                        ),
+                    )
+                    return
+                apply_tor(self.store.proxy, tport)
+                self.store.save()
+
             if restart:
                 ok, start_msg = restart_local_proxy(self.store.proxy)
             else:
@@ -4198,10 +4366,10 @@ class ProxyManagerApp(ctk.CTk):
                 # Proxy configurado — inicia normalmente
                 self._start_proxy_in_background(restart=is_running())
             else:
-                # Sem configuração — aceita o toggle, mostra âmbar e auto-configura
-                self._auto_config_running = True
+                # Sem host/modo: auto-configura. NÃO marcar _auto_config_running aqui —
+                # _start_auto_configure faz isso; marcar antes faz ele retornar no ato
+                # e a UI ficar presa em CONFIGURANDO para sempre.
                 self._proxy_verified = False
-                self._sync_global_switch_label()
                 self.status_label.configure(
                     text="Aguardando proxy… configurando automaticamente",
                     text_color="#fbbf24",
@@ -4482,6 +4650,35 @@ class ProxyManagerApp(ctk.CTk):
 
     def _apply_claude_proxy(self, app: AppRule, *, use_proxy: bool) -> None:
         """Configura settings.json do Claude (default + contas CLAUDE_CONFIG_DIR)."""
+        if use_proxy and (not self._proxy_verified or not is_running()):
+            # Sem Tor/proxy local o Claude cai no MITM da rede (ex.: DNIT) e o Node
+            # falha com "SSL certificate verification failed". Sobe o Tor e reaplica.
+            app.use_proxy = True
+            app.enabled = True
+            self.store.update_app(app)
+            self._touch_recent_app(app)
+            self._sync_app_toggle(app.id, True, persist=True)
+            if app.id not in self._pending_reapply_app_ids:
+                self._pending_reapply_app_ids.append(app.id)
+            self._scanner.invalidate()
+            self._request_scan(min_interval=0, debounce_ms=0)
+            self._toast(
+                "Claude precisa do Tor nesta rede (MITM SSL). Ligando proxy Tor…",
+                "info",
+            )
+            if self._auto_config_running:
+                return
+            # Preferir o caminho do toggle (Tor já é o source) — evita o deadlock
+            # histórico de marcar CONFIGURANDO antes do auto-config.
+            if self.store.proxy.source == "tor" or self.store.proxy.auto_proxy_mode == "tor":
+                self.global_proxy_var.set(True)
+                self._start_proxy_in_background(restart=is_running())
+            else:
+                self._select_auto_proxy_mode("tor", force=True)
+            if app.id not in self._pending_reapply_app_ids:
+                self._pending_reapply_app_ids.append(app.id)
+            return
+
         if self._ensure_proxy_for_launch() is None and use_proxy:
             self._sync_app_toggle(app.id, False, persist=True)
             return

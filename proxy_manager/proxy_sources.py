@@ -746,13 +746,9 @@ def settings_configured(settings: ProxySettings) -> tuple[bool, str]:
     if settings.source == "direct":
         return True, "ok"
     if settings.source == "tor":
-        port = settings.upstream_port or DEFAULT_TOR_PORT
-        ok, msg = tor_status(port)
-        if not ok:
-            return False, msg
-        block = tor_circuit_block(port)
-        if block:
-            return False, block
+        # Modo Tor escolhido = configurado. Serviço/circuito são checados na
+        # ativação (_start_proxy / auto_configure). Misturar tor_circuit_block
+        # aqui faz o toggle cair em "auto-config" e travar a UI em CONFIGURANDO.
         return True, "ok"
 
     host = settings.upstream_host.strip()

@@ -128,33 +128,22 @@ Bootstrapped 100% (done): Done
     assert diagnose_tor_log(log) == ""
 
 
-def test_settings_configured_rejects_stuck_tor(monkeypatch):
+def test_settings_configured_tor_mode_ignores_circuit_health(monkeypatch):
+    """Circuito ruim não desconfigura o modo — senão o toggle trava em auto-config."""
     from proxy_manager.proxy_sources import settings_configured
 
-    monkeypatch.setattr(
-        "proxy_manager.proxy_sources.tor_status",
-        lambda port=9050: (True, "Tor ativo"),
-    )
     monkeypatch.setattr(
         "proxy_manager.proxy_sources.tor_circuit_block",
         lambda port=9050: "rede derruba o handshake (CONNECTRESET)",
     )
     ok, msg = settings_configured(ProxySettings(source="tor", upstream_port=9050))
-    assert ok is False
-    assert "CONNECTRESET" in msg
+    assert ok is True
+    assert msg == "ok"
 
 
-def test_settings_configured_accepts_listening_tor(monkeypatch):
+def test_settings_configured_accepts_tor_source():
     from proxy_manager.proxy_sources import settings_configured
 
-    monkeypatch.setattr(
-        "proxy_manager.proxy_sources.tor_status",
-        lambda port=9050: (True, "Tor ativo"),
-    )
-    monkeypatch.setattr(
-        "proxy_manager.proxy_sources.tor_circuit_block",
-        lambda port=9050: "",
-    )
     ok, msg = settings_configured(ProxySettings(source="tor", upstream_port=9050))
     assert ok is True
     assert msg == "ok"
@@ -269,6 +258,35 @@ def test_path_restriction_explains_only_failed_traffic():
     msg = diagnose_tor_log(log, version="0.4.9.11", traffic_failed=True, now=now)
     assert "hop 1" in msg
     assert "path restriction type 2" in msg
+
+
+def test_repeated_path_restriction_blocks_even_without_failed_traffic():
+    now = datetime.now().astimezone()
+    lines = [f"{_iso(now - timedelta(hours=2))} host Tor[1]: Bootstrapped 100% (done): Done"]
+    for i in range(5):
+        when = _iso(now - timedelta(seconds=30 * (5 - i)))
+        lines.append(
+            f"{when} host Tor[1]: All current guards excluded by path restriction type 2; "
+            "using an additional guard."
+        )
+        lines.append(
+            f"{when} host Tor[1]: Failed to find node for hop #1 of our path. Discarding this circuit."
+        )
+    log = "\n".join(lines)
+    msg = diagnose_tor_log(log, version="0.4.9.11", now=now)
+    assert "hop 1" in msg
+    assert "path restriction type 2" in msg
+
+
+def test_single_path_restriction_still_needs_failed_traffic():
+    now = datetime.now().astimezone()
+    log = (
+        f"{_iso(now - timedelta(hours=1))} host Tor[1]: Bootstrapped 100% (done): Done\n"
+        f"{_iso(now)} host Tor[1]: All current guards excluded by path restriction type 2; "
+        "using an additional guard.\n"
+        f"{_iso(now)} host Tor[1]: Failed to find node for hop #1 of our path. Discarding this circuit.\n"
+    )
+    assert diagnose_tor_log(log, now=now) == ""
 
 
 def test_old_path_restriction_is_ignored_even_if_traffic_failed():
@@ -391,34 +409,42 @@ def test_auto_configure_replaces_tor_after_clock_jump(monkeypatch):
         "proxy_manager.proxy_sources.ensure_tor_for_country",
         lambda country="": (True, "sistema", 9050),
     )
-    monkeypatch.setattr(
-        "proxy_manager.proxy_sources.tor_circuit_block",
-        lambda port=9050: (
-            ""
-            if port == 9051
-            else "Tor descartou os circuitos: o relógio avançou 641s (suspensão ou ajuste do relógio)."
-        ),
-    )
+    calls = {"n": 0}
+
+    def _block(port=9050):
+        calls["n"] += 1
+        # Primeira checagem (sistema/antes do adopt) ainda vê o salto do relógio;
+        # depois do adopt a 9050 já tem circuito.
+        if calls["n"] == 1:
+            return (
+                "Tor descartou os circuitos: o relógio avançou 641s "
+                "(suspensão ou ajuste do relógio)."
+            )
+        return ""
+
+    monkeypatch.setattr("proxy_manager.proxy_sources.tor_circuit_block", _block)
     monkeypatch.setattr(
         "proxy_manager.tor_country.adopt_fresh_tor_after_clock_jump",
-        lambda: (True, "Tor novo em 127.0.0.1:9051", 9051),
+        lambda: (True, "Tor novo em 127.0.0.1:9050", 9050),
     )
     proxy = ProxySettings(source="direct", auto_proxy_mode="tor")
     ok, msg = _auto_configure_tor(proxy)
     assert ok is True
     assert proxy.source == "tor"
-    assert proxy.upstream_port == 9051
-    assert "9051" in msg
+    assert proxy.upstream_port == 9050
+    assert "9050" in msg
 
 
-def test_adopt_reuses_managed_tor_and_reports_when_circuit_stays_down(monkeypatch):
+def test_adopt_restarts_managed_tor_when_circuit_stays_down(monkeypatch):
     from proxy_manager.tor_country import adopt_fresh_tor_after_clock_jump
 
+    started: list[str] = []
     monkeypatch.setattr("proxy_manager.tor_country.is_port_open", lambda host, port: True)
     monkeypatch.setattr("proxy_manager.tor_country._read_pid", lambda: 123)
+    monkeypatch.setattr("proxy_manager.tor_country.clear_tor_hint_cache", lambda: None)
     monkeypatch.setattr(
         "proxy_manager.tor_country.start_managed_tor",
-        lambda country="": (_ for _ in ()).throw(AssertionError("não deveria reiniciar")),
+        lambda country="": started.append(country) or (True, "up"),
     )
     monkeypatch.setattr("proxy_manager.tor_country.wait_for_socks_circuit", lambda port, timeout=45: False)
     monkeypatch.setattr(
@@ -427,7 +453,8 @@ def test_adopt_reuses_managed_tor_and_reports_when_circuit_stays_down(monkeypatc
     )
     ok, msg, port = adopt_fresh_tor_after_clock_jump()
     assert ok is False
-    assert port == 9051
+    assert started == [""]
+    assert port == 9050
     assert "CONNECTRESET" in msg
     assert "relógio avançou" in msg
 
@@ -448,9 +475,9 @@ def test_adopt_starts_managed_tor_and_switches_port(monkeypatch):
     monkeypatch.setattr("proxy_manager.tor_country.note_live_circuit", lambda port: noted.append(port))
     ok, msg, port = adopt_fresh_tor_after_clock_jump()
     assert ok is True
-    assert port == 9051
-    assert noted == [9051]
-    assert "9051" in msg
+    assert port == 9050
+    assert noted == [9050]
+    assert "9050" in msg
 
 
 def test_live_circuit_hides_soft_hint_until_traffic_fails(monkeypatch):

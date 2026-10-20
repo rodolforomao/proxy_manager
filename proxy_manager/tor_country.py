@@ -18,9 +18,12 @@ TOR_PID_FILE = CONFIG_DIR / "tor-instance.pid"
 TOR_LOG_FILE = CONFIG_DIR / "tor-instance.log"
 
 DEFAULT_SYSTEM_TOR_PORT = 9050
-MANAGED_TOR_PORT = 9051
+# Tor do app assume a 9050 (mata o serviço do sistema se estiver no caminho).
+MANAGED_TOR_PORT = 9050
+# Porta antiga do Tor gerenciado — limpa no claim para não deixar instância zumbi.
+_LEGACY_MANAGED_PORTS = (9051,)
 
-# Saída Tor por país (ExitNodes) — desligado até testes; usa Tor do sistema :9050.
+# Saída Tor por país (ExitNodes) via Tor gerenciado em :9050.
 TOR_EXIT_COUNTRY_ENABLED = True
 
 _MISSING_PROTO_RE = re.compile(r"The missing protocols are:\s*(.+)")
@@ -54,6 +57,9 @@ _LOG_TS_RE = re.compile(
 _HINT_TTL = 30.0
 _LIVE_OK_TTL = 45.0
 _PROBE_TTL = 20.0
+# Uma falha de hop/path restriction isolada é normal enquanto o Tor escolhe guards.
+# Só conta como circuito realmente travado quando se repete várias vezes na janela "fresh".
+_ROUTE_STUCK_REPEAT_MIN = 3
 # Reclamação de circuito depois do bootstrap. Mais velha que isso não bloqueia:
 # o journal guarda o timeout, mas um circuito novo pode já ter fechado.
 _CIRCUIT_EVENT_MAX_AGE = timedelta(minutes=10)
@@ -127,12 +133,14 @@ def _sorted_log(text: str) -> str:
 
 def _recent_tor_log(port: int) -> str:
     parts: list[str] = []
+    ours = _read_pid() is not None
     if port == MANAGED_TOR_PORT and TOR_LOG_FILE.exists():
         try:
             parts.append(TOR_LOG_FILE.read_text(encoding="utf-8", errors="replace")[-12000:])
         except OSError:
             pass
-    if port == DEFAULT_SYSTEM_TOR_PORT:
+    # Journal só quando a 9050 não é a nossa instância (serviço systemd ainda no ar).
+    if port == DEFAULT_SYSTEM_TOR_PORT and not ours:
         # Um "-n 120" mistura timeout velho com o flood de hop #1 e ainda
         # perde o "Bootstrapped 100%". Os últimos marcos vêm numa consulta;
         # a janela de 10 min é o que ainda pode ser falha viva.
@@ -206,8 +214,10 @@ def diagnose_tor_log(
     reset_at = -1
     hop_n = ""
     hop_at = -1
+    hop_fresh_count = 0
     restrict_type = ""
     restrict_at = -1
+    restrict_fresh_count = 0
     clock_jump_s = ""
     clock_jump_at = -1
     for idx, line in enumerate(text.splitlines()):
@@ -241,10 +251,12 @@ def diagnose_tor_log(
         if match and fresh:
             hop_n = match.group(1)
             hop_at = idx
+            hop_fresh_count += 1
         match = _RESTRICT_RE.search(line)
         if match and fresh:
             restrict_type = match.group(1)
             restrict_at = idx
+            restrict_fresh_count += 1
         match = _CLOCK_JUMP_RE.search(line)
         if match and fresh:
             clock_jump_s = match.group(1)
@@ -274,8 +286,19 @@ def diagnose_tor_log(
     restrict_current = bool(restrict_type) and _still_current(restrict_at)
     clock_current = bool(clock_jump_s) and _still_current(clock_jump_at)
     route_discarded = traffic_failed and (hop_current or restrict_current)
+    # Hop/path restriction que se repete muitas vezes seguidas nunca fecha um circuito
+    # sozinho — não precisa esperar o tráfego falhar para contar como travado.
+    route_stuck = (
+        hop_current and hop_fresh_count >= _ROUTE_STUCK_REPEAT_MIN
+    ) or (
+        restrict_current and restrict_fresh_count >= _ROUTE_STUCK_REPEAT_MIN
+    )
     circuits_bad = bool(
-        guard_current or timeout_current or reset_current or (traffic_failed and soft_current)
+        guard_current
+        or timeout_current
+        or reset_current
+        or (traffic_failed and soft_current)
+        or route_stuck
     )
     stuck_current = stuck is not None and _still_current(stuck_at)
     broken = bool(
@@ -456,30 +479,37 @@ def wait_for_socks_circuit(port: int, timeout: float = _REPLACE_WAIT) -> bool:
 
 
 def adopt_fresh_tor_after_clock_jump() -> tuple[bool, str, int]:
-    """Troca o Tor do sistema, sem circuito depois do salto do relógio, por um processo novo.
+    """Troca o Tor sem circuito depois do salto do relógio por um processo novo na 9050.
 
     O daemon já bootstrapped deixa de escolher o primeiro salto. Um processo novo
-    volta a fazer handshake. Se a porta 9051 já é nossa, continua o mesmo processo
-    em vez de zerar o bootstrap.
+    volta a fazer handshake. Se a 9050 já é nossa e o CONNECT fecha, reutiliza.
     """
     already = is_port_open("127.0.0.1", MANAGED_TOR_PORT) and _read_pid() is not None
-    if not already:
-        stop_managed_tor()
-        clear_tor_hint_cache()
-        ok, msg = start_managed_tor("")
-        if not ok:
-            return False, msg, DEFAULT_SYSTEM_TOR_PORT
+    if already and wait_for_socks_circuit(MANAGED_TOR_PORT, timeout=8.0):
+        note_live_circuit(MANAGED_TOR_PORT)
+        return (
+            True,
+            f"Tor em 127.0.0.1:{MANAGED_TOR_PORT} "
+            "(circuitos ok após o salto do relógio)",
+            MANAGED_TOR_PORT,
+        )
+
+    clear_tor_hint_cache()
+    # Força processo novo: claim mata o nosso Tor antigo e o do sistema na 9050.
+    ok, msg = start_managed_tor("")
+    if not ok:
+        return False, msg, DEFAULT_SYSTEM_TOR_PORT
     if wait_for_socks_circuit(MANAGED_TOR_PORT):
         note_live_circuit(MANAGED_TOR_PORT)
         return (
             True,
             f"Tor novo em 127.0.0.1:{MANAGED_TOR_PORT} "
-            "(o do sistema perdeu os circuitos quando o relógio avançou)",
+            "(os circuitos caíram quando o relógio avançou)",
             MANAGED_TOR_PORT,
         )
     hint = tor_failure_hint(MANAGED_TOR_PORT, traffic_failed=True, force=True)
     prefix = (
-        "O relógio avançou e o Tor do sistema descartou os circuitos. "
+        "O relógio avançou e o Tor descartou os circuitos. "
         f"Um Tor novo segue em 127.0.0.1:{MANAGED_TOR_PORT}. "
     )
     if hint:
@@ -549,6 +579,82 @@ def stop_managed_tor() -> None:
     _clear_pid()
 
 
+def _kill_listeners_on_port(port: int) -> None:
+    """Encerra quem estiver escutando na porta (Tor do sistema ou instância antiga)."""
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if result.returncode != 0:
+        return
+    for match in re.finditer(r"pid=(\d+)", result.stdout):
+        pid = int(match.group(1))
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.2)
+    for match in re.finditer(r"pid=(\d+)", result.stdout):
+        pid = int(match.group(1))
+        if Path(f"/proc/{pid}").exists():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    if is_port_open("127.0.0.1", port):
+        try:
+            subprocess.run(
+                ["fuser", "-k", f"{port}/tcp"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _stop_system_tor_service() -> None:
+    """Para tor@default / tor para liberar a 9050 ao Tor gerenciado."""
+    for unit in ("tor@default", "tor"):
+        for cmd in (
+            ["systemctl", "stop", unit],
+            ["pkexec", "systemctl", "stop", unit],
+        ):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                return
+
+
+def claim_tor_socks_port(port: int = MANAGED_TOR_PORT) -> None:
+    """Garante a porta SOCKS livre: para o nosso Tor, o do sistema e zumbis legados."""
+    stop_managed_tor()
+    if port == DEFAULT_SYSTEM_TOR_PORT:
+        _stop_system_tor_service()
+    _kill_listeners_on_port(port)
+    for legacy in _LEGACY_MANAGED_PORTS:
+        if legacy != port:
+            _kill_listeners_on_port(legacy)
+    # Espera curta se o bind ainda estiver soltando.
+    deadline = time.monotonic() + 3.0
+    while is_port_open("127.0.0.1", port) and time.monotonic() < deadline:
+        time.sleep(0.15)
+
+
 def write_torrc(exit_country: str = "") -> Path:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -583,7 +689,13 @@ def start_managed_tor(exit_country: str = "") -> tuple[bool, str]:
         if pid:
             return True, f"Tor gerenciado em 127.0.0.1:{MANAGED_TOR_PORT}"
 
-    stop_managed_tor()
+    claim_tor_socks_port(MANAGED_TOR_PORT)
+    if is_port_open("127.0.0.1", MANAGED_TOR_PORT):
+        return False, (
+            f"Não foi possível liberar 127.0.0.1:{MANAGED_TOR_PORT} "
+            "(outro Tor ainda escuta). Pare o serviço: systemctl stop tor@default"
+        )
+
     torrc = write_torrc(exit_country)
 
     try:
@@ -615,19 +727,12 @@ def start_managed_tor(exit_country: str = "") -> tuple[bool, str]:
         time.sleep(0.2)
 
     return False, _explain_managed_log(
-        "Timeout aguardando Tor na porta 9051. A porta SOCKS não abriu."
+        f"Timeout aguardando Tor na porta {MANAGED_TOR_PORT}. A porta SOCKS não abriu."
     )
 
 
 def ensure_tor_for_country(exit_country: str = "") -> tuple[bool, str, int]:
-    """Retorna (ok, mensagem, porta_socks). Com país → Tor gerenciado :9051; senão tenta :9050."""
-    code = exit_country.strip().upper()
-    if code:
-        ok, msg = start_managed_tor(code)
-        return ok, msg, MANAGED_TOR_PORT if ok else DEFAULT_SYSTEM_TOR_PORT
-
-    if is_port_open("127.0.0.1", DEFAULT_SYSTEM_TOR_PORT):
-        return True, f"Tor do sistema em 127.0.0.1:{DEFAULT_SYSTEM_TOR_PORT}", DEFAULT_SYSTEM_TOR_PORT
-
-    ok, msg = start_managed_tor("")
+    """Retorna (ok, mensagem, porta_socks). Sempre Tor gerenciado em :9050."""
+    code = exit_country.strip().lower()
+    ok, msg = start_managed_tor(code)
     return ok, msg, MANAGED_TOR_PORT if ok else DEFAULT_SYSTEM_TOR_PORT
