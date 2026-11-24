@@ -54,6 +54,11 @@ _CLOCK_JUMP_RE = re.compile(
 _LOG_TS_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)\s+"
 )
+# Formato nativo do Tor em stdout (TOR_LOG_FILE), sem ano: "Nov 24 20:07:06.000 [notice] ...".
+# Sem isso, _circuit_line_is_fresh nunca reconhece o horário da nossa própria instância
+# e trata todo evento como "agora" para sempre dentro da sessão.
+_NATIVE_TOR_TS_RE = re.compile(r"^(?P<ts>[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\.\d+)?\s")
+_NATIVE_TOR_TS_FMT = "%b %d %H:%M:%S"
 _HINT_TTL = 30.0
 _LIVE_OK_TTL = 45.0
 _PROBE_TTL = 20.0
@@ -160,17 +165,29 @@ def _recent_tor_log(port: int) -> str:
 
 
 def _circuit_line_is_fresh(line: str, now: datetime) -> bool:
-    """Linha sem horário conta (testes e log da instância). Com horário, só os últimos 10 min."""
+    """Linha sem horário conta (testes). Com horário (journal ISO ou stdout nativo do Tor),
+    só os últimos 10 min."""
     match = _LOG_TS_RE.match(line)
-    if not match:
-        return True
-    try:
-        seen = datetime.fromisoformat(match.group("ts").replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if seen.tzinfo is None:
-        seen = seen.replace(tzinfo=now.tzinfo)
-    return now - seen <= _CIRCUIT_EVENT_MAX_AGE
+    if match:
+        try:
+            seen = datetime.fromisoformat(match.group("ts").replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=now.tzinfo)
+        return now - seen <= _CIRCUIT_EVENT_MAX_AGE
+    native = _NATIVE_TOR_TS_RE.match(line)
+    if native:
+        try:
+            seen = datetime.strptime(native.group("ts"), _NATIVE_TOR_TS_FMT)
+        except ValueError:
+            return True
+        seen = seen.replace(year=now.year, tzinfo=now.tzinfo)
+        # Tor não loga o ano: virada de ano faria a data parecer ~1 ano no futuro.
+        if seen - now > timedelta(days=1):
+            seen = seen.replace(year=seen.year - 1)
+        return now - seen <= _CIRCUIT_EVENT_MAX_AGE
+    return True
 
 
 def _current_session(text: str) -> str:

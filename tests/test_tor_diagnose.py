@@ -234,6 +234,46 @@ def test_old_timeout_after_bootstrap_does_not_block():
     assert diagnose_tor_log(log, version="0.4.9.11", now=now) == ""
 
 
+def test_old_native_log_format_timeout_does_not_block():
+    """TOR_LOG_FILE (stdout da nossa instância) usa "Nov 24 20:07:06.000 [notice] ...",
+    sem ano e sem o prefixo "host Tor[1]:" do journal. Isso precisa envelhecer igual."""
+    now = datetime.now().astimezone()
+    old = now - timedelta(minutes=50)
+    log = (
+        f"{old.strftime('%b %d %H:%M:%S.000')} [notice] Bootstrapped 100% (done): Done\n"
+        f"{old.strftime('%b %d %H:%M:%S.000')} [notice] "
+        "Tried for 1799 seconds to get a connection to [scrubbed]:80. Giving up.\n"
+    )
+    assert diagnose_tor_log(log, version="0.4.9.11", now=now) == ""
+
+
+def test_recent_native_log_format_clock_jump_still_blocks():
+    now = datetime.now().astimezone()
+    recent = now - timedelta(seconds=20)
+    log = (
+        f"{(now - timedelta(hours=1)).strftime('%b %d %H:%M:%S.000')} [notice] "
+        "Bootstrapped 100% (done): Done\n"
+        f"{recent.strftime('%b %d %H:%M:%S.000')} [notice] "
+        "Your system clock just jumped 641 seconds forward; "
+        "assuming established circuits no longer work.\n"
+    )
+    msg = diagnose_tor_log(log, version="0.4.9.11", now=now)
+    assert "relógio avançou 641s" in msg
+
+
+def test_old_native_log_format_clock_jump_does_not_block():
+    now = datetime.now().astimezone()
+    old = now - timedelta(minutes=40)
+    log = (
+        f"{(now - timedelta(hours=2)).strftime('%b %d %H:%M:%S.000')} [notice] "
+        "Bootstrapped 100% (done): Done\n"
+        f"{old.strftime('%b %d %H:%M:%S.000')} [notice] "
+        "Your system clock just jumped 641 seconds forward; "
+        "assuming established circuits no longer work.\n"
+    )
+    assert diagnose_tor_log(log, version="0.4.9.11", now=now) == ""
+
+
 def test_recent_timeout_after_bootstrap_still_blocks():
     now = datetime.now().astimezone()
     log = (
