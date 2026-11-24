@@ -310,6 +310,27 @@ def test_claude_proxy_syncs_alternate_config_dirs(tmp_path, monkeypatch):
     assert "light" in alt_settings.read_text(encoding="utf-8")
 
 
+def test_claude_proxy_skips_lock_directories(tmp_path, monkeypatch):
+    """O Claude Code usa "<conta>.lock" (mkdir) como trava própria — não é config
+    dir, e gravar settings.json ali é um efeito colateral indevido do glob."""
+    from proxy_manager import claude_proxy
+
+    default_dir = tmp_path / ".claude"
+    default_dir.mkdir()
+    default_settings = default_dir / "settings.json"
+    default_settings.write_text("{}\n", encoding="utf-8")
+
+    lock_dir = tmp_path / ".claude-conta1.lock"
+    lock_dir.mkdir()
+
+    monkeypatch.setattr(claude_proxy, "CLAUDE_SETTINGS", default_settings)
+
+    paths = claude_proxy.list_claude_settings_paths()
+    assert default_settings in paths
+    assert not any(p.parent == lock_dir for p in paths)
+    assert not (lock_dir / "settings.json").exists()
+
+
 def test_is_claude_process_recognizes_wrappers():
     from proxy_manager.claude_proxy import _is_claude_process
 

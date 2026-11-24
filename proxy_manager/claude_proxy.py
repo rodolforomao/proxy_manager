@@ -51,10 +51,13 @@ def list_claude_settings_paths() -> list[Path]:
     add(CLAUDE_SETTINGS)
 
     # Contas extras ao lado do diretório default (ex.: ~/.claude-conta1).
+    # O próprio Claude Code cria diretórios "<conta>.lock" (mkdir como trava) —
+    # o glob ".claude-conta*" também bate neles, mas não são config dir: pular.
     home = CLAUDE_SETTINGS.parent.parent
     for directory in sorted(home.glob(".claude-conta*")):
-        if directory.is_dir():
-            add(directory / "settings.json")
+        if not directory.is_dir() or directory.name.endswith(".lock"):
+            continue
+        add(directory / "settings.json")
 
     return paths
 
